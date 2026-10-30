@@ -5,7 +5,7 @@ import { git, gitTry, type RepoInfo } from './git.ts';
 import { withLock } from './mutex.ts';
 import { agentId } from './claims.ts';
 import { conflicts, formatClaim, parseClaim } from './paths.ts';
-import { claimId, listClaims, removeClaim, stateRoot } from './store.ts';
+import { claimId, listClaims, readClaim, removeClaim, stateRoot } from './store.ts';
 import {
   listTaskLiveStates,
   readTaskLive,
@@ -263,7 +263,13 @@ function releaseTaskClaims(info: RepoInfo, state: string, spec: TaskSpec): strin
   const released: string[] = [];
   for (const touch of spec.touches) {
     const claimPath = parseClaim(touch, info);
-    if (removeClaim(state, claimId(claimPath))) released.push(formatClaim(claimPath));
+    const id = claimId(claimPath);
+    // 只删本任务的占位：claim id 由路径决定，过期后可能已被别的任务接管。
+    const record = readClaim(state, id);
+    if (record !== null && record.note === `task ${spec.id}`) {
+      removeClaim(state, id);
+      released.push(formatClaim(claimPath));
+    }
   }
   return released;
 }

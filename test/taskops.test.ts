@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { claimTtlMs } from '../src/claims.ts';
 import { CoworkError, EXIT } from '../src/errors.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
-import { ensureState, listClaims, stateRoot } from '../src/store.ts';
+import { parseClaim } from '../src/paths.ts';
+import { claimId, ensureState, listClaims, stateRoot, writeClaim } from '../src/store.ts';
 import { readTaskLive, transitionTask } from '../src/taskstore.ts';
 import { readTrunkCatalog } from '../src/tasks.ts';
 import {
@@ -471,6 +473,47 @@ test('e2e: add → ready → next → start → report-done → confirm-merge �
     const gotSecond = await next(fixture.info, { agent: 'bob', lane: 'beta', lanePath: fixture.info.laneTop });
     assert.equal(gotSecond.task.id, second.id);
     assert.equal(gotSecond.live.status, 'claimed');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('confirm-merge 只释放本任务的占位，不误删已接管的 claim', async () => {
+  const fixture = makeRepo([ALPHA, BETA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    await next(fixture.info, { agent: 'alice', lane: 'alpha', lanePath: fixture.info.laneTop });
+    await startTask(fixture.info, 't-00a1b2', 'alice');
+    await reportDone(fixture.info, 't-00a1b2', 'alice');
+
+    // 模拟本任务的占位过期后，同一路径被另一个任务接管。
+    const owned = parseClaim('src/alpha/**', fixture.info);
+    writeClaim(fixture.state, {
+      id: claimId(owned),
+      kind: owned.kind,
+      key: owned.key,
+      display: 'src/alpha/**',
+      lane: 'beta',
+      lanePath: fixture.info.laneTop,
+      branch: 'main',
+      agentId: 'bob',
+      pid: process.pid,
+      host: hostname(),
+      note: 'task t-00b3c4',
+      createdAt: new Date().toISOString(),
+      ttlMs: claimTtlMs(),
+    });
+
+    const sha = git(['rev-parse', 'HEAD'], fixture.root);
+    const result = await confirmMerge(fixture.info, 't-00a1b2', {
+      commit: sha,
+      manual: true,
+      reason: '人工验收',
+    });
+    assert.deepEqual(result.released, [], '不属于本任务的 claim 不能报成已释放');
+    const remaining = listClaims(fixture.state);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0]?.note, 'task t-00b3c4');
   } finally {
     fixture.cleanup();
   }

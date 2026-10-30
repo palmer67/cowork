@@ -19,7 +19,7 @@ import {
 } from '../src/store.ts';
 import { readTaskLive, transitionTask } from '../src/taskstore.ts';
 import { readTrunkCatalog } from '../src/tasks.ts';
-import { intentFile, listIntents, next, writeIntent, type NextIntent } from '../src/tasknext.ts';
+import { intentFile, listIntents, next, recoverIntents, writeIntent, type NextIntent } from '../src/tasknext.ts';
 import { removeTree } from './helpers.ts';
 
 interface Fixture {
@@ -224,7 +224,7 @@ test('半成品 pending intent 会先回滚，任务可再次领取', async () =
       lanePath: fixture.info.laneTop,
       specCommit: catalog.rev,
     });
-    const record = makeRecord(fixture, 'src/alpha/**', 'dsh');
+    const record = { ...makeRecord(fixture, 'src/alpha/**', 'dsh'), note: 'task t-00a1b2' };
     writeClaim(fixture.state, record);
     const intent: NextIntent = {
       schemaVersion: 1,
@@ -314,6 +314,77 @@ test('tasks 目录读不出来时 fail closed，不把任务当空集', async ()
     writeFileSync(tasksDir, 'not a directory', 'utf8');
     const err = await expectCode(() => next(fixture.info, { agent: 'dsh' }), EXIT.GENERAL);
     assert.match(err.message, /任务状态不可读/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('committed intent 对应已 merged 的任务时，清掉残留 claim 再删 intent', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    const catalog = readTrunkCatalog(fixture.info);
+    transitionTask(fixture.state, 't-00a1b2', 'claimed', {
+      agent: 'dsh',
+      lane: null,
+      lanePath: fixture.info.laneTop,
+      specCommit: catalog.rev,
+    });
+    transitionTask(fixture.state, 't-00a1b2', 'in_progress', { agent: 'dsh' });
+    transitionTask(fixture.state, 't-00a1b2', 'reported_done', { agent: 'dsh' });
+    transitionTask(fixture.state, 't-00a1b2', 'merged', { lane: null, lanePath: null, agent: null });
+
+    const record = { ...makeRecord(fixture, 'src/alpha/**', 'dsh'), note: 'task t-00a1b2' };
+    writeClaim(fixture.state, record);
+    writeIntent(fixture.state, {
+      schemaVersion: 1,
+      operation_id: 't-00a1b2-merged-leftover',
+      task_id: 't-00a1b2',
+      lane: null,
+      lane_path: fixture.info.laneTop,
+      agent: 'dsh',
+      branch: 'main',
+      prev: null,
+      claim_ids: [record.id],
+      phase: 'committed',
+      created_at: new Date().toISOString(),
+    });
+
+    const report = recoverIntents(fixture.state);
+    assert.deepEqual(report.cleaned, ['t-00a1b2']);
+    assert.equal(readClaim(fixture.state, record.id), null, '残留 claim 应被清掉');
+    assert.deepEqual(listIntents(fixture.state), []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('回滚 pending intent 时，不删 note 不属于本任务的 claim', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    const ready = readTaskLive(fixture.state, 't-00a1b2');
+    assert.ok(ready !== null);
+    const record = { ...makeRecord(fixture, 'src/alpha/**', 'dsh'), note: 'task t-00b3c4' };
+    writeClaim(fixture.state, record);
+    writeIntent(fixture.state, {
+      schemaVersion: 1,
+      operation_id: 't-00a1b2-pending-foreign',
+      task_id: 't-00a1b2',
+      lane: null,
+      lane_path: fixture.info.laneTop,
+      agent: 'dsh',
+      branch: 'main',
+      prev: ready,
+      claim_ids: [record.id],
+      phase: 'pending',
+      created_at: new Date().toISOString(),
+    });
+
+    const report = recoverIntents(fixture.state);
+    assert.deepEqual(report.recovered, ['t-00a1b2']);
+    assert.ok(readClaim(fixture.state, record.id) !== null, '不属于本任务的 claim 不能被回滚删除');
+    assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'ready');
   } finally {
     fixture.cleanup();
   }

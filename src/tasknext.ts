@@ -184,7 +184,8 @@ function rollback(state: string, intent: NextIntent): void {
     if (
       record.lane === intent.lane &&
       record.lanePath === intent.lane_path &&
-      record.agentId === intent.agent
+      record.agentId === intent.agent &&
+      record.note === `task ${intent.task_id}`
     ) {
       removeClaim(state, id);
     }
@@ -199,7 +200,15 @@ function verifyCommitted(state: string, intent: NextIntent): void {
   if (live === null) {
     throw general(`committed intent 对应的 live 缺失: ${intent.task_id}`, '事务状态不完整，拒绝继续。');
   }
-  if (live.status === 'merged' || live.status === 'cancelled') return;
+  if (live.status === 'merged' || live.status === 'cancelled') {
+    // 任务已结束：committed intent 里如果还留着本任务的 claim（confirm-merge/cancel
+    // 中途崩溃），先清掉再删 intent，避免 orphan claim 挡住后续任务。
+    for (const id of intent.claim_ids) {
+      const record = readClaim(state, id);
+      if (record !== null && record.note === `task ${intent.task_id}`) removeClaim(state, id);
+    }
+    return;
+  }
   if (live.lane !== intent.lane || live.lanePath !== intent.lane_path || live.agent !== intent.agent) {
     throw general(
       `committed intent 与 live 的持有者不一致: ${intent.task_id}`,

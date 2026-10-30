@@ -12,7 +12,7 @@
  * 每条检查用独立临时仓库，互不污染；断言以退出码为主，消息只做包含判断。
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -138,6 +138,26 @@ function makeChecker() {
   return { check, notes, done: () => notes };
 }
 
+function commonDir(root) {
+  const r = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  return r.code === 0 ? r.out.trim() : null;
+}
+
+/** live 状态目录下的相对文件清单（用于断言某条命令没写入任何东西）。 */
+function listRel(dir) {
+  if (!existsSync(dir)) return [];
+  const out = [];
+  const walk = (current, prefix) => {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const rel = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) walk(path.join(current, entry.name), rel);
+      else out.push(rel);
+    }
+  };
+  walk(dir, '');
+  return out.sort();
+}
+
 const checks = [];
 const def = (id, title, fn) => checks.push({ id, title, fn });
 
@@ -177,44 +197,97 @@ def(3, 'touches 被占时 next 退出 1 并打印占用者', () => {
   const n = cw(b, ['next'], 'b');
   check(n.code === 1, `期望 next exit 1，实际 ${n.code}：${n.out.trim().slice(0, 200)}`);
   check(n.out.includes('src/auth/login.ts'), '输出里没有冲突路径');
-  check(n.out.includes('a'), '输出里没有占用者车道');
+  check(new RegExp(`lane\\s+a\\b`).test(n.out), `输出里没有占用者车道 a：${n.out.trim().slice(0, 300)}`);
+  check(new RegExp(`agent=(agent-)?a\\b`).test(n.out), `输出里没有占用者 agent a：${n.out.trim().slice(0, 300)}`);
   return done();
 });
 
-// 4. 两车道同时 next 同一任务 → 一个 0 一个 2
-def(4, '并发 next 恰好一方胜出（观察型）', async () => {
-  const observations = [];
-  for (let round = 0; round < 3; round += 1) {
-    const root = newRepo();
-    const a = lane(root, 'a');
-    const b = lane(root, 'b');
-    const { id } = addTask(root, '共享任务', 'src/shared/**');
-    commitAll(root);
-    const ready = cw(root, ['task', 'ready', id]);
-    if (ready.code !== 0) return [`task ready 失败：${ready.out.trim().slice(0, 200)}`];
-    const spawnNext = (cwd, agent) =>
+// 4. 两车道同一 barrier 同时 next → 一个 0 一个 2，输家打印赢家 lane
+def(4, '并发 next 恰好一方胜出，输家打印赢家 lane', async () => {
+  const root = newRepo();
+  const a = lane(root, 'a');
+  const b = lane(root, 'b');
+  const { check, done } = makeChecker();
+  const { id } = addTask(root, '共享任务', 'src/shared/**');
+  check(Boolean(id), 'task add 没给出 id');
+  commitAll(root);
+  const ready = cw(root, ['task', 'ready', id]);
+  check(ready.code === 0, `task ready 失败：${ready.out.trim().slice(0, 200)}`);
+
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'cowork-accept-race-'));
+  TMP.push(dir);
+  const racer = path.join(dir, 'racer.mjs');
+  const racerCode = [
+    "import { spawnSync } from 'node:child_process';",
+    "import fs from 'node:fs';",
+    "const [barrier, readyFile, cli, cwd, agent] = process.argv.slice(2);",
+    "fs.writeFileSync(readyFile, '1');",
+    "const t0 = Date.now();",
+    "while (!fs.existsSync(barrier)) { if (Date.now() - t0 > 15000) process.exit(9); }",
+    "const r = spawnSync(process.execPath, [cli, 'next'], { cwd, encoding: 'utf8', env: { ...process.env, COWORK_AGENT_ID: agent }, windowsHide: true });",
+    "process.stdout.write(JSON.stringify({ code: r.status, out: (r.stdout || '') + (r.stderr || '') }));",
+    '',
+  ].join('\n');
+  writeFileSync(racer, racerCode);
+
+  const racers = [
+    { cwd: a, agent: 'agent-a', tag: 'a' },
+    { cwd: b, agent: 'agent-b', tag: 'b' },
+  ];
+  const readyFiles = racers.map((item, index) => path.join(dir, `ready-${index}`));
+  const kids = racers.map(
+    (item, index) =>
       new Promise((resolve) => {
-        const p = spawn(process.execPath, [CLI, 'next'], {
-          cwd,
-          env: { ...process.env, COWORK_AGENT_ID: agent },
+        const child = spawn(process.execPath, [racer, path.join(dir, 'go'), readyFiles[index], CLI, item.cwd, item.agent], {
           windowsHide: true,
         });
-        let out = '';
-        p.stdout.on('data', (d) => (out += d));
-        p.stderr.on('data', (d) => (out += d));
-        p.on('close', (code) => resolve({ code, out }));
-      });
-    const [ra, rb] = await Promise.all([spawnNext(a, 'a'), spawnNext(b, 'b')]);
-    observations.push([ra.code, rb.code].sort((x, y) => x - y));
-    if (ra.code === 0 && rb.code === 0) {
-      return [`第 ${round + 1} 轮出现双重领取：两方都 exit 0\n${ra.out}\n${rb.out}`];
-    }
-    if (observations.at(-1).join() === '0,2') return [];
+        let buf = '';
+        child.stdout.on('data', (data) => (buf += data));
+        child.on('close', () => {
+          let parsed = { code: -1, out: `racer 没有输出（${buf}）` };
+          try {
+            parsed = JSON.parse(buf);
+          } catch {
+            /* 保留兜底 */
+          }
+          resolve({ ...item, ...parsed });
+        });
+      }),
+  );
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline && !readyFiles.every((file) => existsSync(file))) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  return [
-    `3 轮都没观察到 (0,2)，实际为 ${observations.map((o) => `(${o.join(',')})`).join(' ')}` +
-      '\n  → 可能是进程没真正重叠，也可能是竞争失败也返回 1；需人工确认（工作令 §5.4）',
-  ];
+  check(readyFiles.every((file) => existsSync(file)), '两个 racer 没有同时就位（barrier 超时）');
+  writeFileSync(path.join(dir, 'go'), '1');
+  const settled = await Promise.all(kids);
+  const summary = settled.map((item) => `${item.tag}=${item.code}`).join(' ');
+  const winners = settled.filter((item) => item.code === 0);
+  const losers = settled.filter((item) => item.code !== 0);
+  check(winners.length === 1, `应恰好一个赢家，实际 ${summary}`);
+  check(losers.length === 1 && losers[0].code === 2, `输家应 exit 2，实际 ${summary}`);
+  if (winners.length === 1 && losers.length === 1) {
+    const winner = winners[0];
+    check(
+      new RegExp(`lane\\s+${winner.tag}\\b`).test(losers[0].out),
+      `输家没有打印赢家 lane ${winner.tag}：${losers[0].out.trim().slice(0, 300)}`,
+    );
+  }
+  const common = commonDir(root);
+  const claimsDir = common === null ? null : path.join(common, 'cowork', 'claims');
+  const claims = claimsDir === null ? [] : listRel(claimsDir).filter((file) => file.endsWith('.json'));
+  const shown = cw(root, ['task', 'show', id, '--json']);
+  let touched = [];
+  try {
+    touched = JSON.parse(shown.out).view.touches ?? [];
+  } catch {
+    touched = [];
+  }
+  check(
+    touched.length > 0 && claims.length === touched.length,
+    `claims 数应等于 touches 数（${touched.length}），实际 ${claims.length} 个（不允许部分占位）`,
+  );
+  return done();
 });
 
 // 5. lane 私有未提交 spec 不能 ready
@@ -294,9 +367,19 @@ def(8, 'lane new 名字校验与重名冲突', () => {
     const r = cw(root, ['lane', 'new', bad]);
     check(r.code === 1, `lane new ${bad} 期望 exit 1，实际 ${r.code}`);
   }
+  const common = commonDir(root);
+  const liveRoot = common === null ? null : path.join(common, 'cowork');
+  const before = liveRoot === null ? [] : listRel(liveRoot);
   check(cw(root, ['lane', 'new', 'ok-lane']).code === 0, 'lane new ok-lane 失败');
   const dup = cw(root, ['lane', 'new', 'ok-lane']);
   check(dup.code === 2, `重名期望 exit 2，实际 ${dup.code}`);
+  const after = liveRoot === null ? [] : listRel(liveRoot);
+  const added = after.filter((file) => !before.includes(file));
+  const removed = before.filter((file) => !after.includes(file));
+  check(
+    added.length === 0 && removed.length === 0,
+    `lane new 不应写 live 状态：新增 ${added.join(',') || '无'} / 删除 ${removed.join(',') || '无'}`,
+  );
   const withTask = cw(root, ['lane', 'new', 'other', '--task', 't-000000']);
   check(withTask.code !== 0, '--task 应已移除，却仍然接受');
   return done();
@@ -315,12 +398,62 @@ def(9, '损坏 live 状态时不伪装成空', () => {
   check(doc.code === 1, `doctor 遇到损坏 live 应 exit 1，实际 ${doc.code}`);
   const n = cw(root, ['next']);
   check(n.code !== 0, `next 遇到损坏 live 应 fail closed，实际 exit ${n.code}`);
+
+  // §12.9 半截 pending intent：下一条命令回滚它、清掉 intent、live 回到 ready，随后仍能领到
+  const root2 = newRepo();
+  const laneB = lane(root2, 'b');
+  const added = addTask(root2, '半截事务', 'src/half/**');
+  check(Boolean(added.id), '§12.9 task add 没给出 id');
+  commitAll(root2);
+  check(cw(root2, ['task', 'ready', added.id]).code === 0, '§12.9 task ready 失败');
+  const common2 = commonDir(root2);
+  if (common2 === null) return ['§12.9 拿不到 git-common-dir'];
+  const state2 = path.join(common2, 'cowork');
+  const liveFile = path.join(state2, 'tasks', `${added.id}.json`);
+  const prevLive = JSON.parse(readFileSync(liveFile, 'utf8'));
+  const firstNext = cw(laneB, ['next'], 'b');
+  check(firstNext.code === 0, `§12.9 首次 next 失败：${firstNext.out.trim().slice(0, 300)}`);
+  const claimsDir = path.join(state2, 'claims');
+  const claimFiles = existsSync(claimsDir) ? readdirSync(claimsDir).filter((file) => file.endsWith('.json')) : [];
+  check(claimFiles.length >= 1, `§12.9 首次 next 没有写 claims（${claimFiles.length}）`);
+  const claim = JSON.parse(readFileSync(path.join(claimsDir, claimFiles[0]), 'utf8'));
+  const claimIds = claimFiles.map((file) => file.replace(/\.json$/, ''));
+  const intentsDir = path.join(state2, 'tasks', 'intents');
+  mkdirSync(intentsDir, { recursive: true });
+  writeFileSync(
+    path.join(intentsDir, 'op-half.json'),
+    JSON.stringify(
+      {
+        schemaVersion: 1,
+        operation_id: 'op-half',
+        task_id: added.id,
+        lane: claim.lane,
+        lane_path: claim.lanePath,
+        agent: claim.agentId,
+        branch: claim.branch,
+        prev: prevLive,
+        claim_ids: claimIds,
+        phase: 'pending',
+        created_at: new Date().toISOString(),
+      },
+      null,
+      2,
+    ),
+  );
+  const afterHalf = cw(laneB, ['next'], 'b');
+  check(afterHalf.code === 0, `§12.9 半截 intent 后 next 应成功，实际 ${afterHalf.code}：${afterHalf.out.trim().slice(0, 300)}`);
+  const intentsLeft = existsSync(intentsDir) ? readdirSync(intentsDir) : [];
+  check(intentsLeft.length === 0, `§12.9 intent 没被清除：${intentsLeft.join(',')}`);
+  const liveAfter = JSON.parse(readFileSync(liveFile, 'utf8'));
+  check(
+    liveAfter.status === 'claimed' && liveAfter.lane === 'b',
+    `§12.9 回滚后应重新领给 lane b，实际 status=${liveAfter.status} lane=${liveAfter.lane}`,
+  );
   return done();
 });
 
 // 10. 构建与测试门槛
-def(10, 'npm test ≥60 且 tsc 干净（需 --with-build）', () => {
-  if (!has('--with-build')) return ['跳过：未加 --with-build'];
+def(10, 'npm test ≥60 且 tsc 干净（默认执行）', () => {
   // Windows 上 npm 是 npm.cmd，直接 spawn 会 ENOENT；只有这条命令需要 shell。
   const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32');
   if (test.code !== 0) return [`npm test 退出 ${test.code}\n${test.out.trim().slice(-600)}`];

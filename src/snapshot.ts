@@ -421,7 +421,7 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
   const live = await withLock(
     state,
     () => ({
-      claims: existsSync(state) ? listClaims(state) : [],
+      claims: listClaims(state),
       tasks: listTaskLiveStates(state) as TaskLiveStates,
     }),
     { createStateDir: false },

@@ -1,5 +1,5 @@
 import { hostname } from 'node:os';
-import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { busy, general } from './errors.ts';
 import { currentBranch, type RepoInfo } from './git.ts';
@@ -12,6 +12,7 @@ import {
   ensureState,
   listClaims,
   readClaim,
+  readStateDir,
   removeClaim,
   stateRoot,
   writeClaim,
@@ -146,13 +147,7 @@ function readIntentFile(file: string): NextIntent {
 
 export function listIntents(state: string): { file: string; intent: NextIntent }[] {
   const dir = intentsDir(state);
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return names
+  return readStateDir(dir)
     .filter((name) => name.endsWith('.json'))
     .sort()
     .map((name) => {
@@ -275,12 +270,8 @@ interface World {
 
 function readWorld(state: string): World {
   const lives = new Map<string, TaskLive>();
-  let names: string[] = [];
-  try {
-    names = readdirSync(path.join(state, 'tasks'));
-  } catch {
-    names = [];
-  }
+  // 读不出来必须 fail closed：读不出的任务不能被当成"没有任务"。
+  const names = readStateDir(path.join(state, 'tasks'));
   for (const name of names.filter((item) => /^t-[0-9a-f]{6}\.json$/.test(item))) {
     const live = readTaskLive(state, name.slice(0, -5));
     if (live !== null) lives.set(live.id, live);

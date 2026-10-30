@@ -9,6 +9,7 @@ import type { RepoInfo } from '../src/git.ts';
 import {
   claimFilePath,
   ensureState,
+  listClaimIds,
   listClaims,
   quarantineClaim,
   readClaim,
@@ -139,4 +140,15 @@ test('过期的有效 claim 仍然被清理，未过期的保留', async () => {
 test('quarantineClaim 对不存在的 id 返回 null', () => {
   const { state } = freshFixture();
   assert.equal(quarantineClaim(state, 'missing'), null);
+});
+
+test('claims 目录读不出来时 fail closed，不当作空集', () => {
+  const { state } = freshFixture();
+  rmSync(path.join(state, 'claims'), { recursive: true, force: true });
+  writeFileSync(path.join(state, 'claims'), 'not a dir', 'utf8');
+  for (const run of [() => listClaims(state), () => listClaimIds(state)]) {
+    assert.throws(run, (err: unknown) => {
+      return err instanceof CoworkError && err.code === EXIT.GENERAL && /任务状态不可读/.test(err.message);
+    });
+  }
 });

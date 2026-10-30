@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { claim } from '../src/claims.ts';
+import { CoworkError, EXIT } from '../src/errors.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
 import { parseStatusCount, snapshot, type SnapshotLane } from '../src/snapshot.ts';
 import { ensureState, stateRoot } from '../src/store.ts';
@@ -323,4 +324,16 @@ not json
   assert.equal(alert.task, 't-aaaaaa');
   assert.equal(alert.peer_task, 't-bbbbbb');
   assert.equal(alert.path, 'src/shared', '提醒里的路径用 parseClaim 的 display');
+});
+
+test('claims 目录读不出来时快照 fail closed，不把占位当空集', async () => {
+  const state = stateRoot(info);
+  ensureState(state);
+  rmSync(path.join(state, 'claims'), { recursive: true, force: true });
+  writeFileSync(path.join(state, 'claims'), 'not a directory', 'utf8');
+  await assert.rejects(
+    () => snapshot(info),
+    (err: unknown) =>
+      err instanceof CoworkError && err.code === EXIT.GENERAL && /任务状态不可读/.test(err.message),
+  );
 });

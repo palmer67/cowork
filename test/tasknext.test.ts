@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -300,6 +300,20 @@ test('intent 文件损坏时拒绝继续，且不改动 live', async () => {
     const err = await expectCode(() => next(fixture.info, { agent: 'dsh' }), EXIT.GENERAL);
     assert.match(err.message, /intent 损坏/);
     assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'ready');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('tasks 目录读不出来时 fail closed，不把任务当空集', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    const tasksDir = path.join(fixture.state, 'tasks');
+    rmSync(tasksDir, { recursive: true, force: true });
+    writeFileSync(tasksDir, 'not a directory', 'utf8');
+    const err = await expectCode(() => next(fixture.info, { agent: 'dsh' }), EXIT.GENERAL);
+    assert.match(err.message, /任务状态不可读/);
   } finally {
     fixture.cleanup();
   }

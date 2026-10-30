@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { general, CoworkError } from './errors.ts';
 import type { RepoInfo } from './git.ts';
-import { stateRoot } from './store.ts';
+import { stateRoot, readStateDir } from './store.ts';
 import type { TaskStatus } from './tasks.ts';
 import { assertTransition, isTaskId, isTaskStatus } from './tasks.ts';
 
@@ -154,13 +154,7 @@ export function writeTaskLive(state: string, live: TaskLive): void {
 /** 列出全部 live；坏文件抛错（调用方用 listTaskLiveStates 做诊断视图）。 */
 export function listTaskLive(state: string): TaskLive[] {
   const dir = taskLiveDir(state);
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return names
+  return readStateDir(dir)
     .filter((name) => /^t-[0-9a-f]{6}\.json$/.test(name))
     .map((name) => readTaskLive(state, name.slice(0, -5)))
     .filter((live): live is TaskLive => live !== null)
@@ -175,12 +169,7 @@ export interface TaskLiveStates {
 
 export function listTaskLiveStates(state: string): TaskLiveStates {
   const dir = taskLiveDir(state);
-  let names: string[];
-  try {
-    names = readdirSync(dir);
-  } catch {
-    return { lives: [], corrupt: [] };
-  }
+  const names = readStateDir(dir);
   const lives: TaskLive[] = [];
   const corrupt: { file: string; id: string; error: string }[] = [];
   for (const name of names.filter((item) => /^t-[0-9a-f]{6}\.json$/.test(item)).sort()) {

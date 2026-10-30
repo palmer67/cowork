@@ -22,6 +22,7 @@ import {
   type TaskView,
 } from './taskops.ts';
 import { next } from './tasknext.ts';
+import { doctorTasks } from './taskdoctor.ts';
 import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 
@@ -405,34 +406,45 @@ async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {
   console.log(`主仓库: ${info.mainRoot}`);
   console.log(`共享 git 目录: ${info.commonDir}`);
   console.log(`live 状态: ${stateRoot(info)}`);
-  if (!existsSync(stateRoot(info))) {
-    console.log('状态目录尚未创建（还没运行过任何占位命令）。');
-    return EXIT.OK;
-  }
-  if (!fix) {
+  let bad = false;
+  const state = stateRoot(info);
+  if (!existsSync(state)) {
+    console.log('状态目录尚未创建（还没运行过任何占位或任务命令）。');
+  } else if (!fix) {
     const report = await status(info);
     if (report.expired.length === 0) {
       console.log('未发现过期占位。');
-      return EXIT.OK;
+    } else {
+      bad = true;
+      console.log(`发现 ${report.expired.length} 个已过期占位:`);
+      for (const rec of report.expired) console.log(`  ${rec.display}  ${rec.createdAt}  ${describeAgent(rec)}`);
+      console.log('运行 cowork doctor --fix 清理。');
     }
-    console.log(`发现 ${report.expired.length} 个已过期占位:`);
-    for (const rec of report.expired) console.log(`  ${rec.display}  ${rec.createdAt}  ${describeAgent(rec)}`);
-    console.log('运行 cowork doctor --fix 清理。');
-    return EXIT.OK;
+  } else {
+    const report = await doctorFix(info);
+    for (const rec of report.pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
+    for (const item of report.quarantined) {
+      const where = item.trash === null ? '隔离失败，原文件仍在' : `已隔离到 ${item.trash}`;
+      console.log(`已隔离损坏状态文件 ${item.path}：${where}`);
+      console.log(`  → ${item.reason}`);
+    }
+    if (report.pruned.length === 0 && report.quarantined.length === 0) {
+      console.log('未发现过期占位或损坏状态。');
+    }
   }
-  const report = await doctorFix(info);
-  for (const rec of report.pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
-  for (const item of report.quarantined) {
-    const where = item.trash === null ? '隔离失败，原文件仍在' : `已隔离到 ${item.trash}`;
-    console.log(`已隔离损坏状态文件 ${item.path}：${where}`);
-    console.log(`  → ${item.reason}`);
-  }
-  if (report.pruned.length === 0 && report.quarantined.length === 0) {
-    console.log('未发现过期占位或损坏状态。');
-  }
-  return EXIT.OK;
-}
 
+  const tasks = await doctorTasks(info, fix);
+  for (const line of tasks.fixed) console.log(line);
+  if (tasks.problems.length === 0) {
+    console.log('任务层未发现问题。');
+  } else {
+    bad = true;
+    console.log(`任务层发现 ${tasks.problems.length} 个问题:`);
+    for (const line of tasks.problems) console.log(`  ${line}`);
+    console.log('能自动修的先运行 cowork doctor --fix；spec 问题需要改文件后重新提交。');
+  }
+  return bad ? EXIT.GENERAL : EXIT.OK;
+}
 
 function printTaskRow(view: TaskView): void {
   const lane = view.assigned_lane ?? '(未领取)';

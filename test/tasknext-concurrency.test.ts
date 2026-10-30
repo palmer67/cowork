@@ -180,6 +180,19 @@ test('5 个进程同一时刻 next：恰好一个赢家，其余 exit 2，无残
     assert.ok(claims.every((claim) => claim.note === `task ${fixture.id}`), 'claims 的 note 应指向该任务');
   } finally {
     removeTree(racerDir);
+    // 先让 git 注销 worktree，再删仓库：Windows 上顺序反了会留下锁文件导致 ENOTEMPTY。
+    for (const name of ['a', 'b', 'c', 'd', 'e']) {
+      try {
+        git(['worktree', 'remove', '--force', path.join(fixture.root, '.cowork', 'lanes', name)], fixture.root);
+      } catch {
+        // 车道可能已被测试删除，失败无所谓。
+      }
+    }
+    try {
+      git(['worktree', 'prune'], fixture.root);
+    } catch {
+      // 仓库已不可用时忽略。
+    }
     fixture.cleanup();
   }
 });

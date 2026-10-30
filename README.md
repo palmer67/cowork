@@ -14,7 +14,7 @@ Codex、Claude Code、DSH 这类 agent 各自有独立上下文，却共享同�
 
 ## 状态
 
-M0 与只读看板已完成，通过两轮对抗式评审，`main` 可用：
+M0、只读看板与 M1 任务层已完成，通过多轮对抗式评审，`main` 可用：
 
 | 能力 | 命令 |
 |---|---|
@@ -22,10 +22,15 @@ M0 与只读看板已完成，通过两轮对抗式评审，`main` 可用：
 | 占位 / 释放 | `cowork claim`、`cowork release` |
 | 查看 | `cowork status`、`cowork snapshot` |
 | 只读看板 | `cowork ui`、`cowork ui --watch` |
+| 任务 spec | `cowork task add`、`cowork task ready` |
+| 领取 / 开工 | `cowork next`、`cowork task start` |
+| 交付 | `cowork task report-done`、`cowork task confirm-merge --manual` |
+| 车道 / 交接 | `cowork lane new`、`cowork brief` |
 | 自检 | `cowork doctor` |
 
-M1 任务层（`cowork task` / `cowork next` / `cowork brief` / `cowork lane new`）尚未实现，
-协议已定稿：[docs/ARCHITECTURE-TASKS.md](docs/ARCHITECTURE-TASKS.md)。
+M1 只做任务台本身：确认合并走 `--manual`（没有自动验证三层），任务 id 是不透明的哈希前缀。
+协议见 [docs/ARCHITECTURE-TASKS.md](docs/ARCHITECTURE-TASKS.md)，决策见
+[D9/D10](docs/DECISIONS.md)。
 
 ## 为什么再造一个轮子
 
@@ -83,7 +88,19 @@ cowork ui --watch --open     # 每 2 秒重写一次，浏览器按 meta refresh
 | `cowork snapshot [--json]` | 只读快照：仓库、车道、未提交改动、最近交接、占位、诊断 |
 | `cowork ui [--out <路径>] [--open]` | 生成静态单文件看板，不监听端口 |
 | `cowork ui --watch [--interval <秒>]` | 前台循环重写（默认 2 秒），Ctrl+C 退出 |
-| `cowork doctor [--fix]` | 检查状态目录；`--fix` 清理过期占位、把损坏文件隔离到 `trash/` |
+| `cowork task add --title <标题> [--touches <路径>]...` | 建 draft spec（`.cowork/tasks/<id>.md`），进 ready 后不可改 |
+| `cowork task ls [--status <状态>] [--json]` | 列任务；本地 draft 也可见 |
+| `cowork task show <id> [--json]` | 单条任务与它的 live 状态、历史 |
+| `cowork task ready <id>` | draft → ready；要求 spec 已在 trunk 可达 |
+| `cowork next [--agent <名>]` | 领取最早可干的 ready 任务（事务：intent → lease → claims） |
+| `cowork task start <id>` | claimed → in_progress，只能由 lease 持有者调用 |
+| `cowork task report-done <id>` | in_progress → reported_done |
+| `cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>` | reported_done → merged，释放 lease 与占位 |
+| `cowork task block <id> --reason <文本>` | 标阻塞并记原因 |
+| `cowork task cancel <id> [--reason <文本>]` | 取消任务并释放占位 |
+| `cowork brief [--agent <名>]` | 当前车道该干什么：任务、依赖、占位冲突、最近交接 |
+| `cowork lane new <名> [--base <ref>]` | 建 `cowork/<名>` 车道（worktree） |
+| `cowork doctor [--fix]` | 检查状态与任务；`--fix` 清理过期占位/回收 lease/隔离损坏文件 |
 | `cowork version` | 版本 |
 
 不带参数运行 `cowork` 会打印用法。占位可选 `--note "<备注>"`，备注会带进看板。
@@ -124,7 +141,11 @@ gitignore 的文件，状态放在工作树里就会每车道一份、彼此看�
 ## 看板
 
 `cowork snapshot --json` 是唯一数据源，字段：`schemaVersion`、`generatedAt`、`repo`、
-`tasks`、`contract_alerts`、`claims`、`lanes`。每条车道带
+`tasks`、`task_diagnostics`、`contract_alerts`、`claims`、`lanes`。每条任务带
+`id` / `title` / `status` / `touches` / `reads` / `depends_on` / `done_when` /
+`assigned_lane` / `agent` / `spec_commit` / `updated_at` / `blocked_reason`；读不出的 spec
+或 live 进 `task_diagnostics`，不伪装成"没有这条任务"。`contract_alerts` 当前只报
+reads↔touches 重叠。每条车道带
 `lane` / `branch` / `head` / `dirty` / `changed_file_count` / `observed_at` / `last_handoff`
 （读不出交接待时可带 `handoff_diagnostics`），
 读失败时给 `error` 而不是伪装成 0。主工作树（agent 直接在主仓库里干活的那种）以
@@ -145,14 +166,15 @@ gitignore 的文件，状态放在工作树里就会每车道一份、彼此看�
 ## 已知限制
 
 - 冲突检测只到**文件级**，不做 AST 或 hunk 级自动合并。
-- 只能拉模式：cowork 不启动、不唤醒 agent，谁干活谁自己 `cowork claim`（M1 起是 `cowork next`）。
+- 只能拉模式：cowork 不启动、不唤醒 agent，谁干活谁自己 `cowork claim` 或 `cowork next`。
+- M1 没有自动验证：`confirm-merge` 必须由 agent 显式 `--manual --reason`；自动验证三层是 M2。
 - 只管一个仓库及其 worktree，不跨仓库。
 - `taskkill /F`、断电这类信号够不到的死亡，看板会停在最后一次采样。
 
 ## 开发
 
 ```bash
-npm test                   # 48 个测试：node:test + 真实 git worktree
+npm test                   # 95 个测试：node:test + 真实 git worktree
 npx tsc --noEmit
 npm run build
 node tools/mutex-gate.mjs  # 并发门槛：8 进程 × 1000 次，一次重叠都不能有

@@ -99,3 +99,39 @@ pid 只用于展示与审计，不再参与判定。崩溃回收依靠过期 + `
 
 已知限制：进程被强杀（`taskkill /F`、断电、未捕获异常之外的信号）时来不及写“不带 refresh”的收尾版本，页面仍会按 meta refresh 继续重载，但数据停在最后一次成功采样。因此页头始终显示“数据截至 <时间>，进程停止后不会继续更新。”——看到的旧数据能被识别，而不是伪装成实时。正常退出（Ctrl+C、SIGTERM、SIGHUP、未捕获异常/未处理 rejection）都会先写一次收尾版本再退出；收尾写失败只警告，不改变退出码。
 
+
+## D9 — M1 的 confirm-merge 只走 `--manual`
+
+状态：已定（2026-10-30），M1 实现时确定
+
+M1 的完成链路是 `ready → claimed → in_progress → reported_done → merged`。最后一步必须由
+`cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>` 显式完成：
+`--manual` 与 `--reason` 缺一不可，`--commit` 必须是可解析的 sha。
+
+理由：
+
+- M1 不做自动验证（无 verifying / verify_failed / awaiting_merge 三态，见工作令 §13）。
+  没有验证就自动合并，等于把"agent 说做完了"当成"做完了"。
+- `--reason` 强制留下判断依据；`--manual` 让日志里能清楚区分"人确认"与将来的自动验证，
+  不会在 M2 引入自动态后把两者的历史混在一起。
+- 依赖只认 `merged`：没有这一步，上游任务永远停在 `reported_done`，下游拿不到。
+
+代价：M1 的"完成"依赖 agent 或人主动确认，短期内无法全自动流转；这是刻意的。
+
+## D10 — 任务 id 是不透明的哈希前缀
+
+状态：已定（2026-10-30），M1 实现时确定
+
+`task add` 生成的 id 形如 `t-1a2b3c`：`sha256(title + "
+" + created_at + "
+" + salt)`
+的前 6 位十六进制。它与创建顺序、标题排序、时间都无单调关系，只用于稳定引用。
+
+理由：
+
+- id 会被写进 depends_on、notes、commit message。若按递增编号，两条车道并发创建会撞号；
+  用哈希则天然去重（撞了换 salt 重试，最多 64 次）。
+- 6 位足够在单仓库规模内保持低碰撞率，同时短到能在命令行里手打。
+- 不透明意味着将来换生成策略（更长、不同算法）时，消费方不必改变假设——不要从 id 推断顺序。
+
+代价：人不能从 id 看出创建先后；需要时看 spec 里的 `created_at`。

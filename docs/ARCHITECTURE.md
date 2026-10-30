@@ -47,13 +47,35 @@ docs/
 
 采用 NTFS 目录创建作为抢占原语：所有会改变 claim 集合的操作，先以 `mkdir(<common>/cowork/mutex)` 原子竞争同一个固定互斥目录。成功创建者持有临界区；目录已存在即失败并退避重试。仅当创建者确认 mutex 内的 owner 租约过期且满足回收规则，才可以回收后重试。不得用 `flock`，也不使用“先检查文件不存在再写”的非原子流程。
 
-临界区内读取并校验全部有效 claim，检查 glob/path 冲突，再以唯一 claim ID 创建 claim 目录并写入完整元数据；只有元数据写入成功后 claim 才可见为有效。释放、续租和 stale 回收也必须取得同一互斥目录。读状态的命令可读一致性快照：读取前后比较 generation，若发生变化则重读；简化实现可直接短暂持有 mutex。
+临界区内读取并校验全部有效 claim，检查 glob/path 冲突，再以唯一 claim ID 创建 claim 目录并写入完整元数据；只有元数据写入成功后 claim 才可见为有效。释放、续租和 stale 回收也必须取得同一互斥目录。所有 live 状态读取（包括 `status`、`brief`、`doctor`、`guard`）也必须取得同一 mutex 并在持有期间完成读取；不做无锁快照。读操作等待 mutex 的时间有界，超时按被占用退出 2 并显示 owner。
 
 目录创建是同卷 NTFS 的排他名字创建点，适合作为互斥仲裁；这不是本仓库已实测的结论。M0 必须在目标 Windows/NTFS 环境以多进程压力测试验证，不把 POSIX `rename` 语义作为证明。claim 元数据不依赖覆盖式 rename：在 mutex 下写唯一临时文件、flush/close 后创建最终文件名；遇到 `EEXIST`、`EPERM`、`EBUSY`、`EACCES` 等共享冲突按有界指数退避重试，并重新检查目标状态。超出重试窗口时报一般错误，保留现场并提示运行 `cowork doctor`；不能删除未知 owner 的目录。
 
 mutex 包含 `owner.json`（PID、进程启动时间、操作、创建时间、随机 nonce）。拿到目录后立即写 owner；短临界区必须有操作超时，且释放前完成所有元数据更新。mutex 的回收依据是 owner 进程身份已确认不存在或 PID 已复用，而不是“锁年龄超过 TTL”；进程查询失败时 fail closed。崩溃发生在 owner 写完之前时，缺失 owner 只能在短暂初始化宽限期后由 doctor/竞争者回收。回收前再次检查 owner，并将旧 mutex 隔离到 `trash/`，不能直接递归删除。锁竞争错误按占用处理（退出码 2）；IO、权限或持续杀毒软件占用按一般错误处理（退出码 1），环境前置条件缺失为 3。消息指出当前 owner/状态以及可执行的恢复命令。
 
-### 3.2 Stale 判定状态机
+### 3.2 路径规范化与相等性
+
+claim 的输入统一解释为**仓库根相对路径**，以 `/` 存储；反斜杠只作为 Windows 输入分隔符，规范化后不再保留。拒绝盘符路径、UNC/设备路径、绝对路径以及 `..` 逃出仓库根的路径。先折叠 `.`、重复分隔符和可安全折叠的 `..`，再用 Windows 原生 `realpath` 解析所有已存在的组件；不存在的叶子使用“最近存在的父目录 realpath + 叶子”形成候选。
+
+相等性定义为规范化后的物理路径相等：
+
+- Windows 大小写不敏感，比较使用 ordinal case-fold（不按当前区域设置）；保留显示用原始大小写，但不把大小写差异视为不同 claim。
+- `realpath` 结果用于消除 8.3 短名与长名差异、junction/reparse point 别名和相对段差异。若目标不存在且无法证明短名/长名等价，拒绝该 claim 并要求使用可解析的长路径，不猜测相等性。
+- 解析后的路径必须仍位于仓库物理根之内；junction 指向仓库外、跨卷、无法解析或遇到不支持的 reparse point，一律以环境不满足退出 3。两个不同字符串解析到同一物理路径时视为同一 claim；不能解析为物理路径时不降级为字符串相等。
+- `init` 和每次使用 live store 前检查仓库根、`.git` common dir、`.cowork/lanes` 所在卷均为 NTFS 且在同一卷；卷类型或卷身份无法可靠确认、或发现非 NTFS/跨卷，直接退出 3，禁止退化到“看起来能用”的路径比较。
+
+Windows adapter 通过原生文件系统信息获取卷序列号和文件系统类型，并以 `fs.realpath.native` 获取最终路径；任何 API 不可用、返回不完整或遭遇临时共享冲突都按环境错误/一般 IO 错误分别报告，不使用 `path.normalize` 作为唯一依据。路径规范化结果写入 claim 元数据，冲突检查只比较该结果。
+
+### 3.3 glob 语义
+
+为避免 PowerShell/cmd、Git pathspec 和第三方 glob 库产生不同结果，P0 不实现通用 glob。claim 参数只有两种明确形式：
+
+- **精确文件清单**：`claim --file <path>...`，每个参数必须是一个规范化的仓库相对文件路径；不含通配符。多个文件逐一写入元数据，任一项非法则整条 claim 失败。
+- **递归前缀**：`claim --prefix <dir>` 或兼容草案命令中的 `<dir>/**`，表示目录本身及其所有后代路径；前缀按规范化路径比较，不扫描目录，也保护未来新建文件。
+
+`*`、`?`、`[]`、`{}` 及除末尾 `/**` 外的通配符均拒绝并给出迁移提示；禁止让 shell 先展开参数。精确文件与前缀的冲突规则是：文件等于前缀根、位于前缀下，或两个前缀互为祖先/后代时，均视为重叠并退出 2。元数据同时保留用户输入形式和规范化 matcher，`brief` 显示前者、判定使用后者。未来若需要完整 glob，必须先定义跨平台测试矩阵和版本化语义，不能在现有 claim 数据上静默改变含义。
+
+### 3.4 Stale 判定状态机
 
 claim 是租约，不是永久文件锁。`claim` 写入 `createdAt`、`leaseUntil`、`heartbeatAt`、`laneId`、`claimId`、PID 和进程启动时间；`heartbeat` 在取得全局 mutex 后更新租约。agent 的正常长任务必须按 TTL 的约三分之一续租，或使用前台 `claim --watch` 保持租约；watch 是用户主动运行的前台 CLI 子命令，不是后台守护进程。没有续租的 claim 到期后不再保证排他保护，工具会明确提示这一点。
 
@@ -72,13 +94,13 @@ PID 不能单独证明 owner 存活，需与进程启动时间匹配以规避 PI
 
 崩溃闭环为：进程退出/掉电 → lease 到期 → doctor 或下一次 claim 在 mutex 内复核 → 有效目录先隔离并记录 → 重算冲突并重试 claim。用户不需要手动删除 lock 文件。过期宽限期默认至少一个 heartbeat 周期；具体默认值进入 config 并由测试固定。`doctor --fix` 只处理符合 `stale` 条件的状态，默认 `doctor` 只诊断。
 
-### 3.3 Live 状态位置与可见性
+### 3.5 Live 状态位置与可见性
 
 按 D3 使用 `git rev-parse --path-format=absolute --git-common-dir` 解析 common dir（若 Git 版本不支持该选项，则用 `--git-common-dir` 并相对调用目录规范化），live 根目录固定为 `<common-dir>/cowork/`。所有 lane 调用从自己的 worktree 解析到同一个 common dir，因此只有一份 claims、互斥状态和恢复隔离区。`.cowork/live/` 不作为状态源，避免独立 checkout 各自一份且 gitignore 内容不会随 worktree 复制的错误。
 
 人类可见性由 `cowork status`、`brief`、`doctor` 与 `--json` 提供；不生成易失状态的工作树镜像，避免产生过期副本或误提交。可选地 `doctor` 显示绝对 live 根路径及最近状态更新时间。用户可直接运行只读 `cowork state-path` 查看位置；不提供由多写者维护的镜像文件。
 
-### 3.4 内嵌 worktree 的 Git 陷阱
+### 3.6 内嵌 worktree 的 Git 陷阱
 
 lane checkout 放在 `.cowork/lanes/<slug>/`，其父目录必须被根 `.gitignore` 明确忽略，并在 `init` 与 `doctor` 检查。`.gitignore` 只让 Git 忽略路径，不保护它免受 `git clean -fdx` 删除；因此：
 
@@ -88,7 +110,7 @@ lane checkout 放在 `.cowork/lanes/<slug>/`，其父目录必须被根 `.gitign
 - `git worktree add` 在既有工作树目录中嵌套 checkout 是 Git 支持但容易混淆的布局：目标目录必须不存在/为空，路径不能是另一个已注册 worktree，分支不能已被其他 worktree 检出。lane 建立前校验 slug、路径长度、空目录、分支占用；失败时保留 Git 输出和现场，不自作清理。用 `git worktree list --porcelain` 做登记依据，而非扫描目录猜测。
 - hooks 放在 Git 实际解析的 hooks 目录（以 `git rev-parse --git-path hooks` 取值），复用 common git dir 共享 hooks 的行为。安装前读取有效 `core.hooksPath`；如用户已自定义，安装器在该解析目录落 managed dispatcher 并链式调用既有 hook，或报告冲突让用户显式配置，不覆盖既有 hook。不要写相对 `core.hooksPath`，不要改成相对 `.cowork/...` 路径；移动仓库后的绝对路径由 `doctor` 检测并重新安装提示。hook 入口用 `.cmd`/Node CLI 兼容 `cmd /C`，不依赖 `sh`。
 
-### 3.5 Handoff schema 与可读性
+### 3.7 Handoff schema 与可读性
 
 采用 Markdown 正文加 JSON front matter（YAML front matter 对简单字段虽易读，但解析/转义规则和运行时依赖容易不一致）。顶层 JSON 块只保存稳定、机器可筛选字段；正文用短段落供 Codex/DSH 阅读：
 
@@ -108,7 +130,7 @@ lane checkout 放在 `.cowork/lanes/<slug>/`，其父目录必须被根 `.gitign
 
 字段要求：`schemaVersion/id/createdAt/lane/task/status/files/contracts/next/base`；`summary`、`decisions`、`risks`、`validation` 在正文。CLI 参数提供短路径，并允许 stdin/编辑器补正文；agent 不需要编写复杂 YAML。读取时验证 schemaVersion 与必需字段，未知字段忽略，写入 UTF-8。`brief` 首先给活跃 claim 与 lane，再按 `createdAt` 倒序给最近 N 条 handoff；只展示 `ready` 和最近历史，`superseded` 或超过配置保留期的记录可折叠/排除，但原文件不自动删除。默认 N=5，支持 `--limit`；文件名含 UTC 时间和 slug，避免同秒覆盖。brief 提供来源路径和时间，便于识别陈旧契约。过期不靠自动删知识，而由新 handoff 可显式标记旧记录 `superseded`。
 
-### 3.6 软约束、硬约束与 preflight
+### 3.8 软约束、硬约束与 preflight
 
 分层执行：
 
@@ -119,19 +141,19 @@ lane checkout 放在 `.cowork/lanes/<slug>/`，其父目录必须被根 `.gitign
 
 agent 不调用 preflight 的兜底是 pre-commit guard、全局 `brief/status` 与 doctor 检查；不能声称 hook 可防止编辑覆盖。冲突信息包含 owner lane、分支、文件/模式、handoff 摘要和解决命令。退出码固定遵循 AGENTS.md。preflight 不自动 claim，防止一次误调用占用路径。
 
-### 3.7 同文件并发策略
+### 3.9 同文件并发策略
 
 P0 采用首个有效 claim 获胜；claim 期间同一文件/路径冲突即退出 2。用户故事是不同 agent 预先分工，自动 patch 排队会引入顺序、公平性、应用/rebase 失败和丢失上下文等一整套机制，超出协调层边界。因此不实现 F13 patch 队列，也不把并行写同一文件排队作为当前承诺。冲突双方通过人协调、release/改 scope 或 handoff 后再继续。
 
 `merge --dry-run` 用 Git diff 与 merge-base 报告同文件修改及 hunk 重叠；不作语义合并。未来若需求证明队列必要，应单独设计协议；不得以 Windows 文件锁临时串行化编辑。若将来只需串行应用 patch，优先采用短时目录 mutex + 单个前台 CLI 操作，不引入单写者常驻进程或 daemon。
 
-### 3.8 失败模式全表
+### 3.10 失败模式全表
 
 | 故障 | 检测 | 工具行为 | 恢复/现场 |
 | --- | --- | --- | --- |
 | 断电/系统崩溃 | mutex/claim lease 到期、临时或隔离目录 | fail closed；doctor 标记 stale/corrupt；仅按状态机回收 | 先隔离、保留诊断元数据，再允许重试；无需手删 lock |
 | agent/CLI 崩溃 | 进程退出时间与 lease/heartbeat | 临界区 mutex 可过期回收；claim 等 lease 过期并过宽限期 | doctor 或下一次 claim 取得 mutex 后核验并隔离 stale claim |
-| 用户手改 live 状态 | schema、nonce、generation 校验失败 | claim/guard 拒绝继续（退出 1）；不猜测修复 | `doctor` 输出损坏字段、备份/隔离建议；有效目录不自动覆盖 |
+| 用户手改 live 状态 | schema、nonce 校验失败 | claim/guard 拒绝继续（退出 1）；不猜测修复 | `doctor` 输出损坏字段、备份/隔离建议；有效目录不自动覆盖 |
 | lane 被用户删除 | worktree porcelain 仍登记但路径缺失 | status 标为 missing；claim 仍按原 owner 保护直至释放/过期 | doctor 提供 `git worktree remove/prune` 建议；不自动删除元数据或恢复文件 |
 | base 分支被 force push | 保存的 base OID 与当前 ref 不同，merge-base/ancestor 检查 | merge dry-run 拒绝自动合并并显示两边 OID/差异 | 用户选择新基线并显式 rebase/重建；不改 lane、不丢现场 |
 | 两个用户同时 merge | 目标 ref 前置 OID 校验、Git ref 更新失败 | 只允许 Git 成功更新 ref 的一方；另一方报告目标已变化并重新 dry-run | 不自动重试覆盖；工作树与分支保留，用户重新确认顺序 |
@@ -154,7 +176,6 @@ P0 采用首个有效 claim 获胜；claim 期间同一文件/路径冲突即退
   mutex/owner.json                # 易失：全局短临界区
   claims/<claim-id>/meta.json     # 易失：租约及路径 glob
   trash/<id>/                     # 易失隔离：待人工/doctor 清理的恢复材料
-  generation                      # 易失：一致性快照版本
 ```
 
 live store 初始化使用 mkdir，文件权限按当前 OS 用户默认 ACL；同一 OS 用户是信任边界。存储写入采用版本化 JSON 与 schema 校验。只删除已隔离且超过保留期的 trash 项，并要求显式 `doctor --fix --purge`；默认永远不清现场。
@@ -170,10 +191,13 @@ live store 初始化使用 mkdir，文件权限按当前 OS 用户默认 ACL；�
 ### Windows 并发自动化
 
 - 使用 `node:test` 启动多个独立 `node.exe` 子进程同时 claim 相同与不相交路径。相同路径测试要求恰好一个成功、其余退出 2，且每次运行的共享状态 schema 完整；不同路径可在同一短互斥区内顺序成功。
-- 用 barrier 文件/父进程管道同步竞争开始，循环高次数并记录错误码、claim 数、generation 和残留 mutex；不以线程测试替代多进程测试。
+- 用 barrier 文件/父进程管道同步竞争开始，循环高次数并记录错误码、claim 数和残留 mutex；不以线程测试替代多进程测试。
 - 专门测杀毒软件类暂时占用：由测试进程持有目标文件句柄/模拟 `EPERM`，检查有界重试、现场保留和诊断；此模拟不能替代真实 Defender/NTFS 压测。
 - 子进程在 mutex 写 owner 前后、claim 元数据写一半、lease 更新前后被 `taskkill /T /F` 终止；重启 doctor 后确认 `active/suspect/stale/corrupt` 分类与回收行为，并确认重复执行幂等。
 - 在 NTFS 临时仓库实际执行并发测试；CI 若可用 Windows runner，每次 PR 跑集成组。目录互斥、杀毒/索引器与 Node/Git 版本组合的结论以 Windows 测试记录为准。
+- 运行路径等价性矩阵：大小写差异、`/` 与 `\\`、`.`/`..`、8.3 短名、junction 内外、跨卷和非 NTFS 卷；所有无法证明安全等价或环境不满足的输入必须稳定退出 3。
+- 运行 matcher 矩阵：精确文件、前缀根、前缀后代、两个重叠前缀、非法 `*`/`?`/`[]`/`{}`；确认不发生 shell 展开且冲突结果在 PowerShell 与 cmd 一致。
+- 验证 `status`/`brief`/`doctor`/`guard` 在写者持有 mutex 时的有界等待、owner 提示和退出码；确认 live 状态只通过 mutex 读取。
 
 ### 功能矩阵
 

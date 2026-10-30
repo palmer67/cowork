@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { env } from './errors.ts';
+import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { snapshot } from './snapshot.ts';
 import type {
@@ -52,6 +52,13 @@ function handoffCell(handoff: SnapshotHandoff): string {
   return `${title}<div class="sub mono">${escapeHtml(handoff.id)}${when}</div>`;
 }
 
+/** 交接单读取诊断：哪份文件、什么原因，不能把"读不到"显示成"没有"。 */
+function diagnosticsCell(lane: SnapshotLane): string {
+  const lines = lane.handoff_diagnostics;
+  if (lines === undefined || lines.length === 0) return '';
+  return `<ul class="diag">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`;
+}
+
 function renderLanes(lanes: readonly SnapshotLane[]): string {
   if (lanes.length === 0) {
     return '<p class="empty">没有可读的工作树。git worktree list 应至少包含主工作树。</p>';
@@ -80,7 +87,7 @@ function renderLanes(lanes: readonly SnapshotLane[]): string {
   <td>${branch}</td>
   <td>${head}</td>
   <td>${changesCell(lane)}</td>
-  <td>${handoffCell(lane.last_handoff)}</td>
+  <td>${handoffCell(lane.last_handoff)}${diagnosticsCell(lane)}</td>
   <td>${observed}</td>
 </tr>${err}`;
     })
@@ -153,6 +160,9 @@ tr[hidden]{display:none}
 .badge.warn{background:var(--warn-bg);color:var(--warn)}
 .badge.bad{background:var(--bad-bg);color:var(--bad)}
 .note{max-width:34ch;white-space:pre-wrap;overflow-wrap:anywhere}
+.diag{margin:6px 0 0;padding:0;list-style:none;color:var(--warn);font-size:12px;max-width:42ch}
+.diag li{overflow-wrap:anywhere}
+.diag li::before{content:"! ";font-weight:700}
 .empty{margin:0;padding:20px 0;color:var(--muted);font-size:13px}
 .err{margin:10px 0;padding:9px 12px;border-radius:9px;background:var(--bad-bg);color:var(--bad);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
 footer{color:var(--muted);font-size:12px;padding:2px 2px 0}
@@ -293,7 +303,7 @@ export function writePanel(
     } catch {
       // 清理临时文件失败不掩盖真正的写入错误。
     }
-    throw env(
+    throw general(
       `无法写入面板文件 ${file}: ${err instanceof Error ? err.message : String(err)}`,
       '检查目标目录是否可写；Windows 上避开只读目录和过长的路径。',
     );

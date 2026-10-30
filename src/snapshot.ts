@@ -31,7 +31,9 @@ export interface SnapshotLane {
   dirty: boolean | null;
   changed_file_count: number | null;
   last_handoff: SnapshotHandoff;
-  /** worktree 缺失或 Git 读取失败时出现；此时不可得字段为 null。 */
+  /** 交接单读取诊断（坏 front matter、读不了的文件）；不影响车道其他字段。 */
+  handoff_diagnostics?: string[];
+  /** worktree 缺失、Git 读取失败或交接目录不可读时出现；此时不可得字段为 null。 */
   error?: string;
 }
 
@@ -140,38 +142,69 @@ function normalizeTime(raw: string | null): string | null {
   return Number.isFinite(ms) ? new Date(ms).toISOString() : raw;
 }
 
-/** 读该车道工作树里可见（含未提交）的交接单；坏文件跳过，不影响整份快照。 */
-function readHandoffs(notesDir: string): HandoffMeta[] {
+interface HandoffsRead {
+  metas: HandoffMeta[];
+  diagnostics: string[];
+  /** notes 目录存在但读不了（权限、被占用、同名文件）。 */
+  unreadable: boolean;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 读该车道工作树里可见（含未提交）的交接单。
+ * 坏文件不让整份快照挂掉，但也不能静默：每一项都带上"哪份文件、什么原因"。
+ */
+function readHandoffs(notesDir: string): HandoffsRead {
   let names: string[];
   try {
     names = readdirSync(notesDir);
-  } catch {
-    // 目录存在但读不了（权限、被杀软锁住、或同名文件）时只跳过这条车道，
-    // 不拖垮整份快照——一条车道坏了不该让面板整个挂掉。
-    return [];
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    // 没有 .cowork/notes 是正常情况（还没写过交接单）。
+    if (code === 'ENOENT') return { metas: [], diagnostics: [], unreadable: false };
+    return {
+      metas: [],
+      diagnostics: [`无法读取交接目录 ${notesDir}: ${errorText(err)}`],
+      unreadable: true,
+    };
   }
-  const out: HandoffMeta[] = [];
+  const metas: HandoffMeta[] = [];
+  const diagnostics: string[] = [];
   for (const name of names) {
     if (!name.endsWith('.md')) continue;
     const file = path.join(notesDir, name);
     let text: string;
     try {
       text = readFileSync(file, 'utf8');
-    } catch {
+    } catch (err) {
+      diagnostics.push(`${name}: 无法读取（${errorText(err)}）`);
       continue;
     }
     const body = frontMatter(text);
-    if (body === null) continue;
+    if (body === null) {
+      diagnostics.push(`${name}: 缺少 --- 包裹的 JSON front matter`);
+      continue;
+    }
     let raw: unknown;
     try {
       raw = JSON.parse(body);
-    } catch {
+    } catch (err) {
+      diagnostics.push(`${name}: front matter 不是合法 JSON（${errorText(err)}）`);
       continue;
     }
     const meta = asRecord(raw);
-    if (meta === null) continue;
+    if (meta === null) {
+      diagnostics.push(`${name}: front matter 不是 JSON 对象`);
+      continue;
+    }
     const lane = typeof meta['lane'] === 'string' ? meta['lane'].trim() : '';
-    if (lane === '') continue;
+    if (lane === '') {
+      diagnostics.push(`${name}: 缺少 lane 字段`);
+      continue;
+    }
     const rawTime =
       typeof meta['createdAt'] === 'string'
         ? meta['createdAt']
@@ -188,9 +221,9 @@ function readHandoffs(notesDir: string): HandoffMeta[] {
         : typeof meta['title'] === 'string'
           ? meta['title']
           : null;
-    out.push({ id, created_at: normalizeTime(rawTime), title, path: file, lane });
+    metas.push({ id, created_at: normalizeTime(rawTime), title, path: file, lane });
   }
-  return out;
+  return { metas, diagnostics, unreadable: false };
 }
 
 function timeValue(iso: string | null): number {
@@ -270,11 +303,13 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
     entry.error = `git status 读取失败: ${status.error}`;
   }
 
-  entry.last_handoff = latestHandoff(
-    readHandoffs(path.join(lanePath, '.cowork', 'notes')),
-    lane,
-    worktree.branch,
-  );
+  const handoffs = readHandoffs(path.join(lanePath, '.cowork', 'notes'));
+  if (handoffs.diagnostics.length > 0) {
+    entry.handoff_diagnostics = handoffs.diagnostics;
+    // notes 目录本身读不了时，这条车道的交接信息不可信，按错误暴露出来。
+    if (handoffs.unreadable && entry.error === undefined) entry.error = handoffs.diagnostics[0];
+  }
+  entry.last_handoff = latestHandoff(handoffs.metas, lane, worktree.branch);
   return entry;
 }
 

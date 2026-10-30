@@ -10,6 +10,8 @@
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
 </p>
 
+<p align="center"><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
+
 > 同时开三个 agent 写一个仓库，真正让人返工的不是模型太笨，是它们互相不知道对方在干什么。
 
 Codex 在改 `src/auth/login.ts`，Claude Code 十分钟后也改同一个文件，后写的把先写的盖了，冲突一路拖到 merge 才炸；任务派在聊天里，谁领了、做到哪一步、为什么卡住，全靠人问。`cowork` 补的就是这层协调：

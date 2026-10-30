@@ -1,0 +1,230 @@
+<h1 align="center">cowork</h1>
+
+<p align="center"><strong>Run several coding agents in one repository — without stepping on each other.</strong></p>
+
+<p align="center">
+  <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
+  <img alt="tests" src="https://img.shields.io/badge/tests-104%20passing-brightgreen">
+  <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
+  <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
+</p>
+
+<p align="center"><strong>English</strong> · <a href="README.md">简体中文</a></p>
+
+> When three agents work on one repository, what actually costs you rework isn't a weak model — it's that none of them knows what the others are doing.
+
+Codex edits `src/auth/login.ts`. Ten minutes later Claude Code edits the same file and silently overwrites it. The conflict only surfaces at merge time. Meanwhile the task list lives in a chat thread: who picked it up, how far it got, why it's stuck — someone has to ask. `cowork` adds exactly that coordination layer:
+
+- 🚧 **Lanes** — one `git worktree` per agent, so they physically cannot write to the same tree;
+- 🔒 **Claims** — file-level leases; a collision exits with code `2` and prints who holds the path, instead of printing a warning;
+- 👀 **Shared state** — who holds what, which lane has uncommitted changes, where each task stands: one command, whole picture;
+- 🧵 **Task queue** — specs live in the repo, `next` claims atomically, and a killed process picks up where it left off.
+
+A CLI plus a static HTML board. No daemon, no containers, zero runtime dependencies.
+
+![The cowork board: worktrees, claims, tasks and contract alerts](docs/assets/board.png)
+
+## 30-second tour
+
+```bash
+cd your-repo
+cowork init                      # writes .cowork/config.json, gitignores the lane dir
+cowork lane new dsh              # give an agent its own lane (worktree)
+cd .cowork/lanes/dsh
+
+cowork claim src/auth/login.ts   # reserve the file you're about to edit; exit 2 if taken
+cowork next                      # or: atomically claim a task from the queue
+cowork ui --open                 # open the read-only board
+```
+
+That's the whole loop. The rest is organized by what you actually do with it.
+
+## Three common paths
+
+### 1. Two agents editing the same area
+
+One lane and one terminal each:
+
+```bash
+# terminal 1
+cd .cowork/lanes/dsh
+export COWORK_AGENT_ID=dsh
+cowork claim "src/auth/**"
+
+# terminal 2
+cd .cowork/lanes/codex
+export COWORK_AGENT_ID=codex
+cowork claim src/auth/login.ts
+```
+
+The second call fails immediately and tells you who holds it:
+
+```
+cowork: path already claimed: src/auth/login.ts <- /path/to/repo agent=dsh pid 14236@..., at 2026-10-30T15:45:20.186Z
+  -> run `cowork status` for all claims; wait for `cowork release`, or pick a non-overlapping path.
+```
+
+Run `cowork release` when you're done. Claims expire after 24 hours by default, so a crashed agent cannot lock a file forever.
+
+> There is no `claim --force`. Forcing a claim only lets two agents edit the same file and pushes the conflict to merge time. If you must take over someone else's claim, a human runs `cowork release --force <path>`, which prints the original holder first.
+
+### 2. Hand a task to an agent
+
+A task is a committable, reviewable spec plus a piece of shared live state.
+
+```bash
+cowork task add --title "Add login validation" \
+  --touches src/auth/login.ts \
+  --reads src/auth/token.ts \
+  --done-when "npm test"
+
+git add .cowork/tasks && git commit -m "task: add login validation"
+cowork task ready t-1cb3e3        # requires the spec to be reachable on trunk
+```
+
+The worker picks it up inside a lane:
+
+```bash
+cowork next                       # FIFO, earliest runnable ready task; claims its touches
+cowork task start t-1cb3e3
+# ... edit, commit ...
+cowork task report-done t-1cb3e3
+```
+
+A human confirms the merge (M1 has no automatic verification):
+
+```bash
+cowork task confirm-merge t-1cb3e3 --commit 79195ba --manual --reason "reviewed by hand"
+```
+
+<details>
+<summary>Task state machine</summary>
+
+```
+draft --ready--> ready --next--> claimed --start--> in_progress
+      --report-done--> reported_done --confirm-merge--> merged
+```
+
+`block` / `cancel` are called by the lease holder; `cancel` releases both the lease and the claims. `next` itself is a recoverable transaction: compute candidates -> take the lock -> roll back any unfinished transaction -> recompute -> write intent -> take lease -> claim files. All or nothing — even after a hard kill, the next locking command rolls it back.
+</details>
+
+### 3. See who is touching what
+
+```bash
+cowork status    # current claims: path, lane, holder, expiry
+cowork brief     # what this lane should do: task, deps, cross-lane conflicts, latest handoff
+cowork doctor    # health check: expired claims, orphan leases, corrupt state files (exit 1 on problems)
+```
+
+The board is a single HTML file — no port, no state written:
+
+```bash
+cowork ui --open                 # render and open
+cowork ui --watch --open         # rewrite every 2s in the foreground, Ctrl+C to stop
+```
+
+## Install
+
+Requires **Node ≥ 22.6** and **git ≥ 2.40**. Zero runtime dependencies.
+
+```bash
+git clone https://github.com/palmer67/cowork.git
+cd cowork
+npm install && npm run build
+npm link                 # puts cowork on PATH; or just use `node dist/cli.js <command>`
+```
+
+```bash
+cowork version
+```
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `cowork init` | Initialize the repo (trunk branch, lane directory in `.gitignore`) |
+| `cowork lane new <name>` | Create a `cowork/<name>` lane (worktree) |
+| `cowork claim <path>...` / `cowork release` | Claim / release; `release --force` is how a human breaks a stale claim |
+| `cowork status` / `cowork brief` | Global claim table / this lane's summary |
+| `cowork snapshot --json` | Read-only snapshot for scripts and the board |
+| `cowork ui [--watch]` | Render the single-file board |
+| `cowork task add / ready / show / ls` | Create a spec, promote it to ready, inspect the queue |
+| `cowork next` | Atomically claim a ready task (and its files) |
+| `cowork task start / report-done / confirm-merge` | Start -> deliver -> merge |
+| `cowork task block / cancel` | Mark blocked / cancel (cancel releases claims) |
+| `cowork doctor [--fix]` | Health check; `--fix` clears expired claims, reclaims leases, quarantines corrupt files |
+
+Running `cowork` with no arguments prints the full usage.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success (including idempotent refreshes) |
+| `1` | General error: bad arguments, no claimable task, dependency not merged, corrupt state file |
+| `2` | Busy or conflicting: claim collision, lost `next` race, duplicate lane |
+| `3` | Environment not satisfied: not a git repo, git missing, path escapes the repo |
+
+Error messages always include **who holds it** and **how to resolve it**, so scripts can branch on the exit code alone.
+
+## FAQ
+
+<details><summary><code>cowork claim</code> exits 2 but nobody is around?</summary>
+
+Run `cowork status` for the full table: the holder may be in another lane, or it may be your own earlier claim in another worktree. Once you're sure it's dead, a human runs `cowork release --force <path>`.
+</details>
+
+<details><summary>Do claims ever go away on their own?</summary>
+
+Yes — they expire after 24 hours and any command reclaims them in passing. Liveness is TTL-only, never pid-based: every CLI invocation is a short-lived process, so pid checks would wipe a claim made seconds ago.
+</details>
+
+<details><summary><code>cowork next</code> says there is nothing to claim?</summary>
+
+Three causes, each reported separately: no `ready` tasks, a dependency not yet `merged`, or the task's `touches` currently claimed by another lane. `cowork task ls` shows the queue.
+</details>
+
+<details><summary>Does it run on Linux / macOS?</summary>
+
+The code is plain Node with no native dependencies, but the concurrency primitives are verified against Windows/NTFS semantics (directory locks, case-folded paths, `cmd /C` hooks). Other platforms are unverified.
+</details>
+
+## What it deliberately does not do
+
+- No task decomposition, no LLM scheduling, no pushing tasks at agents — whoever works pulls with `cowork next`;
+- No automatic fan-out; parallelism is bounded only by dependencies, `touches`, and claims;
+- No write-side daemon, no Electron, no listening port;
+- No Docker / WSL, no background processes;
+- No AST-level auto-merge; conflict detection stops at the file level;
+- Never modifies the installation or binaries of Codex, Claude Code, DSH, or any other agent.
+
+## Known limitations
+
+- Claims are **file-level** only; no hunk or AST merge;
+- Pull-only: cowork never launches an agent;
+- Serialization is per repository; multiple repos are not coordinated;
+- Deaths that get no signal (`taskkill /F`, power loss) leave the board at its last sample — the header always shows the data timestamp.
+
+## Contributing
+
+```bash
+npm test                              # 104 tests: node:test against real git worktrees
+npx tsc --noEmit                      # type check
+npm run build                         # compile to dist/
+node tools/mutex-gate.mjs             # concurrency gate: 8 processes x 1000 runs, zero overlap
+node tools/accept-m1.mjs --with-build # M1 acceptance (10 checks)
+```
+
+The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight from source via `node --experimental-strip-types`. Design docs live in [`docs/`](docs/); handoff notes in [`.cowork/notes/`](.cowork/notes/) — cowork is managed by cowork itself.
+
+## Docs
+
+- [Plan: requirements, constraints, acceptance criteria](docs/PLAN.md)
+- [Architecture: paths, claims, worktrees, failure modes](docs/ARCHITECTURE.md)
+- [Task layer protocol: task object, dispatch, snapshot contract](docs/ARCHITECTURE-TASKS.md)
+- [Decisions, including ones that were overturned and how to reproduce](docs/DECISIONS.md)
+
+## License
+
+MIT

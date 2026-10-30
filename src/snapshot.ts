@@ -257,7 +257,8 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
   if (head.ok) entry.head = head.out;
 
   const status = attempt(
-    ['status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    // Windows 长路径：不开 core.longpaths 时 git status 会在深目录上失败。
+    ['-c', 'core.longpaths=true', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
     lanePath,
   );
   entry.observed_at = new Date().toISOString();
@@ -325,7 +326,8 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
       continue;
     }
     const rel = path.relative(lanesRoot, path.resolve(worktree.path));
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    // 按路径段判断，不能 startsWith('..')：合法车道名可以就叫 ..hidden。
+    if (rel === '' || path.isAbsolute(rel) || rel.split(path.sep).includes('..')) continue;
     lanes.push(observeLane(worktree, rel.split(path.sep).join('/')));
   }
   lanes.sort((a, b) => {

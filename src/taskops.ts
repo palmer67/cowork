@@ -10,6 +10,7 @@ import {
   listTaskLiveStates,
   readTaskLive,
   transitionTask,
+  type TaskLiveStates,
   type LiveStatus,
   type TaskLive,
 } from './taskstore.ts';
@@ -68,12 +69,14 @@ function toView(spec: TaskSpec, live: TaskLive | null): TaskView {
 }
 
 /** trunk catalog 为准；本地未提交的 draft 也列出（标成 draft，不参与 next）。 */
-export function collectTaskViews(info: RepoInfo, catalog: TaskCatalog): TaskListView {
+export function collectTaskViews(
+  info: RepoInfo,
+  catalog: TaskCatalog,
+  liveStates: TaskLiveStates = listTaskLiveStates(stateRoot(info)),
+): TaskListView {
   const local = listLocalSpecs(info);
-  const state = stateRoot(info);
   const lives = new Map<string, TaskLive>();
   const diagnostics: TaskDiagnostic[] = [...catalog.diagnostics, ...local.diagnostics];
-  const liveStates = listTaskLiveStates(state);
   for (const live of liveStates.lives) lives.set(live.id, live);
   for (const item of liveStates.corrupt) diagnostics.push({ file: item.file, error: item.error });
 

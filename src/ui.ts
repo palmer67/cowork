@@ -7,10 +7,12 @@ import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { snapshot } from './snapshot.ts';
 import type {
+  ContractAlert,
   Snapshot,
   SnapshotClaim,
   SnapshotHandoff,
   SnapshotLane,
+  SnapshotTask,
 } from './snapshot.ts';
 
 const HTML_ESCAPES: Record<string, string> = {
@@ -131,6 +133,82 @@ function renderClaims(claims: readonly SnapshotClaim[]): string {
 </table>`;
 }
 
+const STATUS_TONES: Record<string, 'ok' | 'warn' | 'bad' | undefined> = {
+  merged: 'ok',
+  cancelled: 'bad',
+  blocked: 'bad',
+  reported_done: 'warn',
+  in_progress: 'warn',
+  ready: 'warn',
+};
+
+function statusBadge(status: string): string {
+  return badge(status, STATUS_TONES[status]);
+}
+
+function renderTasks(tasks: readonly SnapshotTask[]): string {
+  if (tasks.length === 0) {
+    return '<p class="empty">还没有任务。cowork task add 创建 spec，cowork next 领取。</p>';
+  }
+  const rows = tasks
+    .map((task) => {
+      const lane =
+        task.assigned_lane === null
+          ? '<span class="sub">(未领取)</span>'
+          : `<span class="mono">${escapeHtml(task.assigned_lane)}</span>`;
+      const agent = task.agent === null ? '' : `<div class="sub mono">${escapeHtml(task.agent)}</div>`;
+      const blocked =
+        task.blocked_reason === null
+          ? ''
+          : `<ul class="diag"><li>${escapeHtml(task.blocked_reason)}</li></ul>`;
+      const deps =
+        task.depends_on.length === 0
+          ? '<span class="sub">—</span>'
+          : task.depends_on.map((dep) => `<span class="mono">${escapeHtml(dep)}</span>`).join('<br>');
+      const spec =
+        task.spec_commit === null
+          ? '<span class="sub">—</span>'
+          : `<span class="mono">${escapeHtml(task.spec_commit.slice(0, 7))}</span>`;
+      return `<tr>
+  <td><span class="mono">${escapeHtml(task.id)}</span><div>${escapeHtml(task.title)}</div>${blocked}</td>
+  <td>${statusBadge(task.status)}</td>
+  <td>${lane}${agent}</td>
+  <td>${deps}</td>
+  <td>${spec}</td>
+</tr>`;
+    })
+    .join('');
+  return `<table>
+<thead><tr><th>任务</th><th>状态</th><th>车道 / agent</th><th>依赖</th><th>spec</th></tr></thead>
+<tbody>${rows}</tbody>
+</table>`;
+}
+
+/** §8 唯一的契约提醒：本任务 reads 与另一活跃任务 touches 重叠。 */
+function renderAlerts(alerts: readonly ContractAlert[]): string {
+  if (alerts.length === 0) return '';
+  const rows = alerts
+    .map(
+      (alert) => `<tr>
+  <td><span class="mono">${escapeHtml(alert.task)}</span></td>
+  <td><span class="mono">${escapeHtml(alert.path)}</span></td>
+  <td><span class="mono">${escapeHtml(alert.peer_task)}</span></td>
+</tr>`,
+    )
+    .join('');
+  return `<h3 class="sub">契约提醒（reads ↔ 其他任务的 touches）</h3>
+<table>
+<thead><tr><th>读方任务</th><th>路径</th><th>写方任务</th></tr></thead>
+<tbody>${rows}</tbody>
+</table>`;
+}
+
+function renderTaskDiagnostics(lines: readonly string[]): string {
+  if (lines.length === 0) return '';
+  return `<p class="err">有 ${lines.length} 条任务读取失败；这些任务没有进入上面的列表。</p>
+<ul class="diag">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`;
+}
+
 const STYLE = `
 :root{color-scheme:light dark;--bg:#f5f6f8;--panel:#fff;--ink:#1b1f24;--muted:#667085;--line:#e4e7ec;--chip:#f2f4f7;--accent:#2563eb;--ok:#067647;--ok-bg:#d1fadf;--warn:#b54708;--warn-bg:#fef0c7;--bad:#b42318;--bad-bg:#fee4e2;--mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace}
 @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#161a21;--ink:#e6e9ef;--muted:#9aa4b2;--line:#28303b;--chip:#1f252e;--accent:#7aa2ff;--ok:#6ce9a6;--ok-bg:#0f2e1d;--warn:#f5c26b;--warn-bg:#3a2a12;--bad:#f97066;--bad-bg:#3a1512}}
@@ -205,7 +283,8 @@ export function renderPanel(snap: Snapshot, options: RenderOptions = {}): string
   const repoName = path.basename(snap.repo.root) === '' ? snap.repo.root : path.basename(snap.repo.root);
   const dirtyLanes = snap.lanes.filter((lane) => lane.dirty === true).length;
   const expiredClaims = snap.claims.filter((claim) => claim.expired).length;
-  const filterable = snap.lanes.length + snap.claims.length > 0;
+  const blockedTasks = snap.tasks.filter((task) => task.status === 'blocked').length;
+  const filterable = snap.lanes.length + snap.claims.length + snap.tasks.length > 0;
   const head = snap.repo.head === null ? '?' : snap.repo.head;
 
   return `<!doctype html>
@@ -233,7 +312,7 @@ ${refreshSeconds === undefined ? '' : `<meta http-equiv="refresh" content="${ref
       : `数据截至 ${escapeHtml(localTime(snap.generatedAt))}，watch 每 ${refreshSeconds} 秒重写。`
   }</span>
 </div>
-${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分支 / 占位 / 交接…" aria-label="过滤表格">' : ''}
+${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分支 / 占位 / 任务…" aria-label="过滤表格">' : ''}
 <section class="card">
   <div class="card-head">
     <h2>工作树</h2>
@@ -255,10 +334,14 @@ ${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分
 <section class="card">
   <div class="card-head">
     <h2>任务与契约</h2>
-    <span class="sub">M1</span>
+    <span class="sub">${snap.tasks.length} 个${blockedTasks > 0 ? `，${blockedTasks} 个被阻塞` : ''}${
+      snap.task_diagnostics.length > 0 ? `，${snap.task_diagnostics.length} 条读取失败` : ''
+    }</span>
   </div>
-  <div class="card-body">
-    <p class="empty">任务层还没实现：snapshot 的 tasks 与 contract_alerts 目前固定为空数组。</p>
+  <div class="card-body table-wrap">
+    ${renderTasks(snap.tasks)}
+    ${renderTaskDiagnostics(snap.task_diagnostics)}
+    ${renderAlerts(snap.contract_alerts)}
   </div>
 </section>
 <footer>数据只来自 cowork snapshot --json；${

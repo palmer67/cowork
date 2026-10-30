@@ -168,10 +168,12 @@ export function listTaskLive(state: string): TaskLive[] {
 }
 
 /** snapshot/doctor 用：坏 live 变成诊断项，不拖垮整份视图。 */
-export function listTaskLiveStates(state: string): {
+export interface TaskLiveStates {
   lives: TaskLive[];
   corrupt: { file: string; id: string; error: string }[];
-} {
+}
+
+export function listTaskLiveStates(state: string): TaskLiveStates {
   const dir = taskLiveDir(state);
   let names: string[];
   try {

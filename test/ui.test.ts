@@ -67,6 +67,7 @@ const snap: Snapshot = {
   generatedAt: '2026-10-30T08:00:00.000Z',
   repo: { root: 'D:\\repo', head: 'abc1234' },
   tasks: [],
+  task_diagnostics: [],
   claims: [
     {
       path: 'src/<x>.ts',
@@ -104,6 +105,7 @@ const EMPTY: Snapshot = {
   generatedAt: '2026-10-30T08:00:00.000Z',
   repo: { root: 'D:\\repo', head: null },
   tasks: [],
+  task_diagnostics: [],
   claims: [],
   contract_alerts: [],
   lanes: [],
@@ -147,7 +149,54 @@ test('空仓库面板不渲染过滤器，并给出空态说明', () => {
   assert.ok(!html.includes('document.getElementById'), '没有行时不注入过滤脚本');
   assert.ok(html.includes('没有可读的工作树。'));
   assert.ok(html.includes('当前没有占位。'));
-  assert.ok(html.includes('任务层还没实现'));
+  assert.ok(html.includes('还没有任务。'));
+});
+
+test('任务卡片渲染状态、阻塞原因、契约提醒与读取诊断', () => {
+  const withTasks: Snapshot = {
+    ...snap,
+    tasks: [
+      {
+        id: 't-00a1b2',
+        title: '<b>alpha</b>',
+        status: 'claimed',
+        touches: ['src/a/**'],
+        reads: [],
+        depends_on: ['t-00b3c4'],
+        done_when: ['npm test'],
+        assigned_lane: 'alpha',
+        agent: 'dsh',
+        spec_commit: '1234567890abcdef1234567890abcdef12345678',
+        updated_at: '2026-10-30T08:00:00.000Z',
+        blocked_reason: null,
+      },
+      {
+        id: 't-00c5d6',
+        title: 'blocked one',
+        status: 'blocked',
+        touches: ['src/shared/x.ts'],
+        reads: [],
+        depends_on: [],
+        done_when: [],
+        assigned_lane: 'beta',
+        agent: 'codex',
+        spec_commit: null,
+        updated_at: null,
+        blocked_reason: '等设计确认 <x>',
+      },
+    ],
+    task_diagnostics: ['t-cccccc.md: 任务规格无效'],
+    contract_alerts: [{ kind: 'reads_touches', task: 't-00a1b2', path: 'src/shared/**', peer_task: 't-00c5d6' }],
+  };
+  const html = renderPanel(withTasks);
+  assert.ok(html.includes('2 个，1 个被阻塞，1 条读取失败'), '任务计数与阻塞/诊断汇总');
+  assert.ok(html.includes('t-00a1b2'));
+  assert.ok(html.includes('&lt;b&gt;alpha&lt;/b&gt;'), '任务标题必须转义');
+  assert.ok(html.includes('等设计确认 &lt;x&gt;'), '阻塞原因必须转义');
+  assert.ok(html.includes('契约提醒'));
+  assert.ok(html.includes('src/shared/**'));
+  assert.ok(html.includes('有 1 条任务读取失败'));
+  assert.ok(html.includes('1234567'), 'spec_commit 只显示前 7 位');
 });
 
 test('panelPath 按 commonDir 稳定，writePanel 落盘且内容与渲染一致', () => {

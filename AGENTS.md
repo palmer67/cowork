@@ -44,6 +44,15 @@ claim 的存活**只由 TTL 决定**，与进程 pid 无关：每次 `cowork cla
   否则会被当成同一个 owner 而不互斥
 - claim 的事务语义：多个路径要么全部占上，要么一条都不写
 
+## 文件读写（DSH 写保护）
+
+DSH 默认装了写保护插件（`dsh-fs-observation-policy`）：**覆盖或编辑已存在的文件之前，本会话必须先用 `read` 工具读过它**。用 shell（`cat`、`Get-Content`、`node -e`）读不算观察记录；观察记录也不跨会话继承，恢复或新开的会话等于没读过。
+
+- 改已有文件：先 `read`，再 `edit` / `write`。不要「shell 看一眼 → 直接写」。
+- 新建文件：直接 `write`；如果目标可能已存在，先 `read` 一次。
+- 看到 `cannot modify "<path>": file has not been read` 是保护机制触发了，不是命令写错：读一次再重试即可。
+- 不要为了绕过它去关插件或改用 shell 重定向写文件——那等于放弃覆盖保护。
+
 ## 代码约定
 
 - ESM，`node:` 前缀导入内建模块。

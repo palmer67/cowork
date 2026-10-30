@@ -9,13 +9,16 @@
 
 ## 项目定位（别扩散）
 
-`cowork` 是**协调层**，不是调度器。
+`cowork` 是**协作纪律层**：包含由人和 agent 共同拆解、人工录入的任务队列，负责依赖、占位和汇总；任务判断与拆解智能留在 agent 侧。
 
-- ❌ 不做 agent 调度 / 任务队列 / 并行 fan-out
+- ❌ 不自动拆解任务、不做 LLM 调度、不启动或推送任务给 Codex/DSH 等 agent；agent 通过拉模式调用 `cowork next` 自行领取
+- ❌ 不做自动 fan-out；并行边界只由依赖、touches、claim 规则确定
 - ❌ 不做 Web UI / 桌面面板（CLI 优先，`--json` 供将来接 GUI）
 - ❌ 不用 Docker / WSL / 后台守护进程
 - ❌ 不修改 Codex、DSH 等 agent 的安装或二进制
 - ❌ 不做 AST 级自动合并，冲突检测只到文件 + hunk 重叠
+
+任务对象、领取、并行和完成协议见 [docs/ARCHITECTURE-TASKS.md](docs/ARCHITECTURE-TASKS.md)。底层路径与 claim/mutex 规则继续以 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §3 为准。
 
 ## 硬约束
 

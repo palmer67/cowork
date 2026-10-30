@@ -45,7 +45,7 @@
 
 ## 2. 非目标（明确不做）
 
-1. 不做 agent 调度器 / 任务队列 / 并行 fan-out。谁来干活由人决定。
+1. 有任务层，但智能在 agent 侧（人 + agent 拆任务）；cowork 只负责纪律（队列、依赖、占位、汇总）。不做自动拆解、不做 LLM 调度、不启动 agent 进程或推送派工。Agent 通过拉模式自行调用 `cowork next` 领取可执行任务。详见 `docs/ARCHITECTURE-TASKS.md`。
 2. 不做 Web UI 或桌面面板。CLI 优先，`--json` 供将来接 GUI。
 3. 不用容器、不用 Docker、不用 WSL、不起后台守护进程。
 4. 不改 Codex / DSH 的安装或二进制。只能通过 AGENTS.md、git hook、CLI、可选的 MCP server 接入。

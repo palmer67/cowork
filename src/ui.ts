@@ -1,0 +1,294 @@
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { env } from './errors.ts';
+import type { RepoInfo } from './git.ts';
+import type {
+  Snapshot,
+  SnapshotClaim,
+  SnapshotHandoff,
+  SnapshotLane,
+} from './snapshot.ts';
+
+const HTML_ESCAPES: Record<string, string> = {
+  '&': '&amp;',
+  '<': '&lt;',
+  '>': '&gt;',
+  '"': '&quot;',
+  "'": '&#39;',
+};
+
+/** 所有进入 HTML 的数据都必须先过这里；面板是纯文本表格，不拼接任何 URL。 */
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] ?? ch);
+}
+
+function localTime(iso: string | null): string {
+  if (iso === null) return '—';
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  const d = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function badge(text: string, tone?: 'ok' | 'warn' | 'bad'): string {
+  return `<span class="badge${tone === undefined ? '' : ` ${tone}`}">${escapeHtml(text)}</span>`;
+}
+
+function changesCell(lane: SnapshotLane): string {
+  if (lane.dirty === null) return '<span class="sub">—</span>';
+  if (!lane.dirty) return badge('干净', 'ok');
+  return badge(`${lane.changed_file_count ?? 0} 个文件`, 'warn');
+}
+
+function handoffCell(handoff: SnapshotHandoff): string {
+  if (handoff.id === null) return '<span class="sub">—</span>';
+  const title = handoff.title === null ? '' : `<div>${escapeHtml(handoff.title)}</div>`;
+  const when = handoff.created_at === null ? '' : ` · ${escapeHtml(localTime(handoff.created_at))}`;
+  return `${title}<div class="sub mono">${escapeHtml(handoff.id)}${when}</div>`;
+}
+
+function renderLanes(lanes: readonly SnapshotLane[]): string {
+  if (lanes.length === 0) {
+    return '<p class="empty">没有登记的车道。在 .cowork/lanes/ 下 git worktree add 出来的车道会出现在这里。</p>';
+  }
+  const rows = lanes
+    .map((lane) => {
+      const err =
+        lane.error === undefined
+          ? ''
+          : `<tr class="err-row"><td colspan="6"><p class="err">${escapeHtml(lane.error)}</p></td></tr>`;
+      const branch =
+        lane.branch === null
+          ? badge('detached', 'warn')
+          : `<span class="mono">${escapeHtml(lane.branch)}</span>`;
+      const head =
+        lane.head === null
+          ? '<span class="sub">—</span>'
+          : `<span class="mono">${escapeHtml(lane.head)}</span>`;
+      const observed =
+        lane.observed_at === null
+          ? '<span class="sub">—</span>'
+          : `<span class="sub mono">${escapeHtml(localTime(lane.observed_at))}</span>`;
+      return `<tr>
+  <td><span class="mono">${escapeHtml(lane.lane)}</span></td>
+  <td>${branch}</td>
+  <td>${head}</td>
+  <td>${changesCell(lane)}</td>
+  <td>${handoffCell(lane.last_handoff)}</td>
+  <td>${observed}</td>
+</tr>${err}`;
+    })
+    .join('');
+  return `<table>
+<thead><tr><th>车道</th><th>分支</th><th>HEAD</th><th>未提交</th><th>最近交接</th><th>采样时间</th></tr></thead>
+<tbody>${rows}</tbody>
+</table>`;
+}
+
+function renderClaims(claims: readonly SnapshotClaim[]): string {
+  if (claims.length === 0) {
+    return '<p class="empty">当前没有占位。agent 运行 cowork claim &lt;路径&gt; 占位后会出现在这里。</p>';
+  }
+  const rows = claims
+    .map((claim) => {
+      const lane =
+        claim.lane === null
+          ? '<span class="sub">(主工作树)</span>'
+          : `<span class="mono">${escapeHtml(claim.lane)}</span>`;
+      const note =
+        claim.note === null
+          ? '<span class="sub">—</span>'
+          : `<div class="note">${escapeHtml(claim.note)}</div>`;
+      const expires = claim.expired
+        ? badge('已过期', 'bad')
+        : `<span class="sub mono">${escapeHtml(localTime(claim.expiresAt))}</span>`;
+      return `<tr>
+  <td><span class="mono">${escapeHtml(claim.path)}</span></td>
+  <td>${badge(claim.kind === 'prefix' ? '目录' : '文件')}</td>
+  <td>${lane}</td>
+  <td>${escapeHtml(claim.agent)}<div class="sub mono">pid ${claim.pid}@${escapeHtml(claim.host)}</div></td>
+  <td>${note}</td>
+  <td>${expires}</td>
+</tr>`;
+    })
+    .join('');
+  return `<table>
+<thead><tr><th>路径</th><th>类型</th><th>车道</th><th>占用者</th><th>备注</th><th>过期时间</th></tr></thead>
+<tbody>${rows}</tbody>
+</table>`;
+}
+
+const STYLE = `
+:root{color-scheme:light dark;--bg:#f5f6f8;--panel:#fff;--ink:#1b1f24;--muted:#667085;--line:#e4e7ec;--chip:#f2f4f7;--accent:#2563eb;--ok:#067647;--ok-bg:#d1fadf;--warn:#b54708;--warn-bg:#fef0c7;--bad:#b42318;--bad-bg:#fee4e2;--mono:ui-monospace,SFMono-Regular,"Cascadia Mono",Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#161a21;--ink:#e6e9ef;--muted:#9aa4b2;--line:#28303b;--chip:#1f252e;--accent:#7aa2ff;--ok:#6ce9a6;--ok-bg:#0f2e1d;--warn:#f5c26b;--warn-bg:#3a2a12;--bad:#f97066;--bad-bg:#3a1512}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:28px 20px 56px}
+.wrap{max-width:1180px;margin:0 auto;display:grid;gap:16px}
+header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline}
+h1{font-size:20px;margin:0;font-weight:650}
+h2{font-size:13px;margin:0;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
+.sub{color:var(--muted);font-size:12.5px}
+.mono{font-family:var(--mono);font-size:12.5px}
+.toolbar{display:flex;flex-wrap:wrap;gap:4px 18px;align-items:center}
+input[type=search]{width:min(360px,100%);padding:8px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel);color:var(--ink);font:inherit}
+input[type=search]:focus{outline:2px solid var(--accent);outline-offset:1px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.card-head{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:13px 16px;border-bottom:1px solid var(--line)}
+.card-body{padding:4px 16px 10px}
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:10px 14px 10px 0;vertical-align:top;border-bottom:1px solid var(--line)}
+th{font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap}
+td:last-child,th:last-child{padding-right:0}
+tbody tr:last-child td{border-bottom:none}
+tr[hidden]{display:none}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600;white-space:nowrap;background:var(--chip);color:var(--muted)}
+.badge.ok{background:var(--ok-bg);color:var(--ok)}
+.badge.warn{background:var(--warn-bg);color:var(--warn)}
+.badge.bad{background:var(--bad-bg);color:var(--bad)}
+.note{max-width:34ch;white-space:pre-wrap;overflow-wrap:anywhere}
+.empty{margin:0;padding:20px 0;color:var(--muted);font-size:13px}
+.err{margin:10px 0;padding:9px 12px;border-radius:9px;background:var(--bad-bg);color:var(--bad);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
+footer{color:var(--muted);font-size:12px;padding:2px 2px 0}
+`;
+
+const FILTER_SCRIPT = `<script>
+(() => {
+  const input = document.getElementById('filter');
+  if (input === null) return;
+  const rows = Array.from(document.querySelectorAll('tbody tr:not(.err-row)'));
+  const errors = Array.from(document.querySelectorAll('tbody tr.err-row'));
+  const apply = () => {
+    const q = input.value.trim().toLowerCase();
+    for (const row of rows) row.hidden = q !== '' && !row.textContent.toLowerCase().includes(q);
+    for (const row of errors) row.hidden = q !== '';
+  };
+  input.addEventListener('input', apply);
+})();
+</script>`;
+
+/** 静态单文件面板：自包含、无外部资源、不联网。 */
+export function renderPanel(snap: Snapshot): string {
+  const repoName = path.basename(snap.repo.root) === '' ? snap.repo.root : path.basename(snap.repo.root);
+  const dirtyLanes = snap.lanes.filter((lane) => lane.dirty === true).length;
+  const expiredClaims = snap.claims.filter((claim) => claim.expired).length;
+  const filterable = snap.lanes.length + snap.claims.length > 0;
+  const head = snap.repo.head === null ? '?' : snap.repo.head;
+
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>cowork · ${escapeHtml(repoName)}</title>
+<style>${STYLE}</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>cowork · ${escapeHtml(repoName)}</h1>
+  <span class="sub">只读面板</span>
+</header>
+<div class="toolbar mono sub">
+  <span title="仓库根">${escapeHtml(snap.repo.root)}</span>
+  <span>HEAD ${escapeHtml(head)}</span>
+  <span>生成于 ${escapeHtml(localTime(snap.generatedAt))}</span>
+</div>
+${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分支 / 占位 / 交接…" aria-label="过滤表格">' : ''}
+<section class="card">
+  <div class="card-head">
+    <h2>车道</h2>
+    <span class="sub">${snap.lanes.length} 条${snap.lanes.length === 0 ? '' : `，${dirtyLanes} 条有未提交改动`}</span>
+  </div>
+  <div class="card-body table-wrap">
+    ${renderLanes(snap.lanes)}
+  </div>
+</section>
+<section class="card">
+  <div class="card-head">
+    <h2>占位</h2>
+    <span class="sub">${snap.claims.length} 个${expiredClaims > 0 ? `，其中 ${expiredClaims} 个已过期` : ''}</span>
+  </div>
+  <div class="card-body table-wrap">
+    ${renderClaims(snap.claims)}
+  </div>
+</section>
+<section class="card">
+  <div class="card-head">
+    <h2>任务与契约</h2>
+    <span class="sub">M1</span>
+  </div>
+  <div class="card-body">
+    <p class="empty">任务层还没实现：snapshot 的 tasks 与 contract_alerts 目前固定为空数组。</p>
+  </div>
+</section>
+<footer>数据只来自 cowork snapshot --json；本页由 cowork ui 生成，不读取 .git/cowork，也不写任何状态。重新运行 cowork ui 可刷新。</footer>
+</div>
+${filterable ? FILTER_SCRIPT : ''}
+</body>
+</html>`;
+}
+
+/** 每个仓库一份固定路径，重复运行覆盖同一个文件，标签页刷新即可。 */
+export function panelPath(info: RepoInfo): string {
+  const digest = createHash('sha1')
+    .update(info.commonDir.toLowerCase())
+    .digest('hex')
+    .slice(0, 12);
+  return path.join(tmpdir(), 'cowork-ui', digest, 'index.html');
+}
+
+export interface WritePanelOptions {
+  out?: string | undefined;
+}
+
+export function writePanel(
+  info: RepoInfo,
+  snap: Snapshot,
+  options: WritePanelOptions = {},
+): string {
+  const file = options.out === undefined ? panelPath(info) : path.resolve(options.out);
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, renderPanel(snap), 'utf8');
+  } catch (err) {
+    throw env(
+      `无法写入面板文件 ${file}: ${err instanceof Error ? err.message : String(err)}`,
+      '检查目标目录是否可写；Windows 上避开只读目录和过长的路径。',
+    );
+  }
+  return file;
+}
+
+/** 只在用户显式 --open 时调用；失败不影响面板本身。 */
+export async function openPanel(file: string): Promise<void> {
+  let command: string;
+  let args: string[];
+  if (process.platform === 'win32') {
+    command = 'cmd';
+    args = ['/c', 'start', '', file];
+  } else if (process.platform === 'darwin') {
+    command = 'open';
+    args = [file];
+  } else {
+    command = 'xdg-open';
+    args = [file];
+  }
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve();
+    });
+  });
+}

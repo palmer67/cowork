@@ -4,7 +4,9 @@ import path from 'node:path';
 import { claim, doctorFix, expiresAt, release, status } from './claims.ts';
 import { CoworkError, EXIT, general } from './errors.ts';
 import { currentBranch, headCommit, repoInfo, type RepoInfo } from './git.ts';
+import { snapshot, type Snapshot } from './snapshot.ts';
 import { stateRoot, type ClaimRecord } from './store.ts';
+import { openPanel, writePanel } from './ui.ts';
 
 const USAGE = `cowork — 多 agent 同仓协作纪律层
 
@@ -13,6 +15,9 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork claim <路径>...          占位（精确文件或目录前缀，目录可写 dir/**）
   cowork release [<路径>...]      释放占位（省略路径则释放本工作树全部）
   cowork status [--json]          查看当前全部占位
+  cowork snapshot [--json]        只读快照：车道、未提交改动与占位
+  cowork ui [--out <路径>] [--open]
+                                  生成只读看板（静态 HTML，不监听端口）
   cowork doctor [--fix]           检查状态目录与残留占位
   cowork version                  版本
 
@@ -25,7 +30,9 @@ interface Args {
   values: Map<string, string>;
 }
 
-/** 只需要 `--flag`、`--key=value` 和 `--note <文本>` 三种形式。 */
+/** 只需要 `--flag`、`--key=value` 和值型 flag（`--note <文本>`、`--out <路径>`）。 */
+const VALUE_FLAGS = new Set(['note', 'out']);
+
 function parseArgs(argv: readonly string[]): Args {
   const [command = '', ...tail] = argv;
   const rest: string[] = [];
@@ -44,8 +51,8 @@ function parseArgs(argv: readonly string[]): Args {
       continue;
     }
     const next = tail[i + 1];
-    if (body === 'note' && next !== undefined && !next.startsWith('--')) {
-      values.set('note', next);
+    if (VALUE_FLAGS.has(body) && next !== undefined && !next.startsWith('--')) {
+      values.set(body, next);
       i += 1;
       continue;
     }
@@ -178,6 +185,87 @@ async function runStatus(info: RepoInfo, json: boolean): Promise<number> {
   return EXIT.OK;
 }
 
+function stamp(iso: string | null): string {
+  if (iso === null) return '—';
+  const ms = Date.parse(iso);
+  if (!Number.isFinite(ms)) return iso;
+  const d = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function printSnapshot(snap: Snapshot): void {
+  console.log(`仓库: ${snap.repo.root}`);
+  console.log(`HEAD: ${snap.repo.head ?? '?'}`);
+  console.log(`生成于: ${stamp(snap.generatedAt)}`);
+  console.log('');
+  if (snap.lanes.length === 0) {
+    console.log('车道: 没有登记的车道（.cowork/lanes/ 下还没有 worktree）。');
+  } else {
+    const laneWidth = Math.min(Math.max(...snap.lanes.map((l) => l.lane.length), 4), 24);
+    const branchWidth = Math.min(
+      Math.max(...snap.lanes.map((l) => (l.branch ?? 'detached').length), 6),
+      28,
+    );
+    console.log(`车道 (${snap.lanes.length}):`);
+    for (const lane of snap.lanes) {
+      const changes =
+        lane.dirty === null
+          ? '未知'
+          : lane.dirty
+            ? `${lane.changed_file_count ?? 0} 个文件`
+            : '干净';
+      const handoff =
+        lane.last_handoff.id === null
+          ? '—'
+          : `${lane.last_handoff.id}（${stamp(lane.last_handoff.created_at)}）`;
+      console.log(
+        `  ${lane.lane.padEnd(laneWidth)}  ${(lane.branch ?? 'detached').padEnd(branchWidth)}  ${lane.head ?? '?'}  ${changes.padEnd(8)}  最近交接 ${handoff}`,
+      );
+      if (lane.error !== undefined) console.log(`  ↳ ${lane.error}`);
+    }
+  }
+  console.log('');
+  const expired = snap.claims.filter((claim) => claim.expired).length;
+  console.log(`占位: ${snap.claims.length} 个${expired > 0 ? `（其中 ${expired} 个已过期）` : ''}`);
+  for (const claim of snap.claims) {
+    const lane = claim.lane === null ? '(主工作树)' : claim.lane;
+    const expires = claim.expired ? '已过期' : stamp(claim.expiresAt);
+    const note = claim.note === null ? '' : `  备注: ${claim.note}`;
+    console.log(
+      `  ${claim.path}  ${lane}  ${claim.agent} pid ${claim.pid}@${claim.host}  过期 ${expires}${note}`,
+    );
+  }
+  console.log('');
+  console.log('运行 cowork ui 生成只读看板。');
+}
+
+async function runSnapshot(info: RepoInfo, json: boolean): Promise<number> {
+  const snap = await snapshot(info);
+  if (json) {
+    console.log(JSON.stringify(snap, null, 2));
+    return EXIT.OK;
+  }
+  printSnapshot(snap);
+  return EXIT.OK;
+}
+
+async function runUi(info: RepoInfo, args: Args): Promise<number> {
+  const snap = await snapshot(info);
+  const file = writePanel(info, snap, { out: args.values.get('out') });
+  console.log(file);
+  console.log('面板已生成；重新运行 cowork ui 可刷新，浏览器刷新页面即可看到新数据。');
+  if (args.flags.has('open')) {
+    try {
+      await openPanel(file);
+    } catch (err) {
+      console.warn(`cowork: 无法自动打开浏览器: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn('  → 面板已生成，直接打开上面的路径即可。');
+    }
+  }
+  return EXIT.OK;
+}
+
 async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {
   console.log(`主仓库: ${info.mainRoot}`);
   console.log(`共享 git 目录: ${info.commonDir}`);
@@ -226,6 +314,10 @@ async function main(argv: readonly string[]): Promise<number> {
       return runRelease(info, rest, flags.has('force'));
     case 'status':
       return runStatus(info, flags.has('json'));
+    case 'snapshot':
+      return runSnapshot(info, flags.has('json'));
+    case 'ui':
+      return runUi(info, args);
     case 'doctor':
       return runDoctor(info, flags.has('fix'));
     default:

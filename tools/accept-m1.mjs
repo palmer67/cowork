@@ -27,7 +27,9 @@ const opt = (name, fallback) => {
 const CLI = path.resolve(opt('--cli', 'dist/cli.js'));
 const ONLY = opt('--only', '')
   .split(',')
-  .map((s) => Number(s.trim()))
+  .map((s) => s.trim())
+  .filter((s) => s !== '')
+  .map((s) => Number(s))
   .filter((n) => Number.isFinite(n));
 
 if (!existsSync(CLI)) {
@@ -67,12 +69,13 @@ process.on('exit', () => {
   }
 });
 
-function run(cmd, args, cwd, env = {}) {
+function run(cmd, args, cwd, env = {}, shell = false) {
   const r = spawnSync(cmd, args, {
     cwd,
     encoding: 'utf8',
     env: { ...process.env, ...env },
     windowsHide: true,
+    shell,
     timeout: 120_000,
   });
   return { code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
@@ -318,12 +321,13 @@ def(9, '损坏 live 状态时不伪装成空', () => {
 // 10. 构建与测试门槛
 def(10, 'npm test ≥60 且 tsc 干净（需 --with-build）', () => {
   if (!has('--with-build')) return ['跳过：未加 --with-build'];
-  const test = run('npm', ['test'], process.cwd());
+  // Windows 上 npm 是 npm.cmd，直接 spawn 会 ENOENT；只有这条命令需要 shell。
+  const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32');
   if (test.code !== 0) return [`npm test 退出 ${test.code}\n${test.out.trim().slice(-600)}`];
   const m = test.out.match(/#\s*tests\s+(\d+)/);
   const count = m ? Number(m[1]) : 0;
   if (count < 60) return [`子测试数 ${count} < 60`];
-  const tsc = run('npx', ['tsc', '--noEmit'], process.cwd());
+  const tsc = run('npx', ['tsc', '--noEmit'], process.cwd(), {}, process.platform === 'win32');
   if (tsc.code !== 0) return [`tsc 失败：\n${tsc.out.trim().slice(-600)}`];
   return [];
 });

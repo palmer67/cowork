@@ -21,13 +21,13 @@
 ## next 事务设计（20 行）
 
 1. 锁外：`readTrunkCatalog(info)` 把 trunk 固定 commit 的 spec 读进内存，得到候选集 C。
-2. C 的选取：live 缺失或 `ready`；`depends_on` 全部 `merged`；touches 与未过期 claims、held lease 均不冲突。
+2. C 的选取：live 存在且 `status === 'ready'`（live 缺失按 `draft` 处理，永不可领）；`depends_on` 全部 `merged`；touches 与未过期 claims、held lease 均不冲突。
 3. 取锁，第一件事 `recoverIntents(state)`：扫 `<state>/tasks/intents/*.json`。
 4. `pending` intent：按 claim_ids 删除本 intent 写的 claims（lane+agent 必须匹配），把 live 恢复成 `prev`（`prev=null` 则删文件）。
 5. `committed` intent：核对 live 的 lane/agent 与 claim_ids 全部存在且归属一致；缺一个即 `corrupt`。
 6. 恢复中任何一步失败：`markCorrupt` + exit 1，宁可停下也不把任务交给第二个 owner。
 7. 锁内用同一 commit 重算 C'；C' 非空取 FIFO(created_at, id) 第一个。
-8. C' 空且 C 非空：exit 2，打印赢家（task、lane、agent、领取时间）。
+8. C' 空且 C 非空：exit 2，打印赢家（task、lane、agent、领取时间）；但若 C 非空只是因 touches 被手工 claim / held lease 占、没有任何任务赢家 → exit 1，逐条打印占用者（与 §12.3 同语义）。
 9. 都空：exit 1，逐条打印阻塞原因（等哪个依赖、哪条路径被谁占）。
 10. 写 intent：operation_id、task_id、lane、prev、claim_ids、phase=`pending`。
 11. 写 lease：live 置 `claimed`，lane/lanePath/agent/spec_commit 落盘。

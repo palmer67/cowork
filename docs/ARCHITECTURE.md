@@ -55,13 +55,13 @@ mutex 包含 `owner.json`（PID、进程启动时间、操作、创建时间、�
 
 ### 3.2 路径规范化与相等性
 
-claim 的输入统一解释为**仓库根相对路径**，以 `/` 存储；反斜杠只作为 Windows 输入分隔符，规范化后不再保留。拒绝盘符路径、UNC/设备路径、绝对路径以及 `..` 逃出仓库根的路径。先折叠 `.`、重复分隔符和可安全折叠的 `..`，再用 Windows 原生 `realpath` 解析所有已存在的组件；不存在的叶子使用“最近存在的父目录 realpath + 叶子”形成候选。
+claim 的输入统一解释为**主仓库根的逻辑相对路径**，以 `/` 存储；反斜杠只作为 Windows 输入分隔符，规范化后不再保留。命令先取得当前 worktree 的 `git rev-parse --show-toplevel`：主工作树的结果就是主仓库根，lane 的结果视同主仓库根，并在内部先剥掉 `.cowork/lanes/<slug>` 前缀，再生成逻辑键。因此 `src/auth/login.ts` 在 main、lane A、lane B 中永远是同一个冲突键。拒绝盘符路径、UNC/设备路径、绝对路径以及 `..` 逃出当前 worktree 的路径。先折叠 `.`、重复分隔符和可安全折叠的 `..`，再用 Windows 原生 `realpath` 解析所有已存在的组件；不存在的叶子使用“最近存在的父目录 realpath + 叶子”形成候选。
 
-相等性定义为规范化后的物理路径相等：
+相等性定义为规范化后的**逻辑相对路径键**相等；物理路径不是冲突键：
 
-- Windows 大小写不敏感，比较使用 ordinal case-fold（不按当前区域设置）；保留显示用原始大小写，但不把大小写差异视为不同 claim。
-- `realpath` 结果用于消除 8.3 短名与长名差异、junction/reparse point 别名和相对段差异。若目标不存在且无法证明短名/长名等价，拒绝该 claim 并要求使用可解析的长路径，不猜测相等性。
-- 解析后的路径必须仍位于仓库物理根之内；junction 指向仓库外、跨卷、无法解析或遇到不支持的 reparse point，一律以环境不满足退出 3。两个不同字符串解析到同一物理路径时视为同一 claim；不能解析为物理路径时不降级为字符串相等。
+- Windows 大小写不敏感，权威规则以 NTFS `$UpCase` 表为准（不按当前区域设置）；ordinal case-fold 只是纯 JS 预检查的近似，不能替代 NTFS 结果。保留显示用原始大小写，但不把大小写差异视为不同 claim。
+- 逻辑键用于跨 worktree 冲突判定；`realpath` 只用于消除 8.3 短名与长名差异、junction/reparse point 别名和相对段差异，并证明路径没有越界。若目标不存在且无法证明短名/长名等价，拒绝该 claim 并要求使用可解析的长路径，不猜测相等性。
+- 解析后的物理路径必须仍位于仓库物理根之内；junction 指向仓库外、跨卷、无法解析或遇到不支持的 reparse point，一律以环境不满足退出 3。两个 worktree 中同一个逻辑键即使 realpath 不同，也必须视为同一 claim；realpath 不能替代逻辑键。
 - `init` 和每次使用 live store 前检查仓库根、`.git` common dir、`.cowork/lanes` 所在卷均为 NTFS 且在同一卷；卷类型或卷身份无法可靠确认、或发现非 NTFS/跨卷，直接退出 3，禁止退化到“看起来能用”的路径比较。
 
 Windows adapter 通过原生文件系统信息获取卷序列号和文件系统类型，并以 `fs.realpath.native` 获取最终路径；任何 API 不可用、返回不完整或遭遇临时共享冲突都按环境错误/一般 IO 错误分别报告，不使用 `path.normalize` 作为唯一依据。路径规范化结果写入 claim 元数据，冲突检查只比较该结果。
@@ -154,6 +154,7 @@ P0 采用首个有效 claim 获胜；claim 期间同一文件/路径冲突即退
 | 断电/系统崩溃 | mutex/claim lease 到期、临时或隔离目录 | fail closed；doctor 标记 stale/corrupt；仅按状态机回收 | 先隔离、保留诊断元数据，再允许重试；无需手删 lock |
 | agent/CLI 崩溃 | 进程退出时间与 lease/heartbeat | 临界区 mutex 可过期回收；claim 等 lease 过期并过宽限期 | doctor 或下一次 claim 取得 mutex 后核验并隔离 stale claim |
 | 用户手改 live 状态 | schema、nonce 校验失败 | claim/guard 拒绝继续（退出 1）；不猜测修复 | `doctor` 输出损坏字段、备份/隔离建议；有效目录不自动覆盖 |
+| 硬链接让两个逻辑路径指向同一文件 | `realpath` 不会合并硬链接的文件 ID | 已知限制：仍按逻辑键判定，可能放行两个不同键；不宣称能检测 | 文档与 doctor 诊断提示避免用硬链接跨 claim；未来可单独增加 file-ID 检查，不在 M0 实现 |
 | lane 被用户删除 | worktree porcelain 仍登记但路径缺失 | status 标为 missing；claim 仍按原 owner 保护直至释放/过期 | doctor 提供 `git worktree remove/prune` 建议；不自动删除元数据或恢复文件 |
 | base 分支被 force push | 保存的 base OID 与当前 ref 不同，merge-base/ancestor 检查 | merge dry-run 拒绝自动合并并显示两边 OID/差异 | 用户选择新基线并显式 rebase/重建；不改 lane、不丢现场 |
 | 两个用户同时 merge | 目标 ref 前置 OID 校验、Git ref 更新失败 | 只允许 Git 成功更新 ref 的一方；另一方报告目标已变化并重新 dry-run | 不自动重试覆盖；工作树与分支保留，用户重新确认顺序 |
@@ -190,12 +191,15 @@ live store 初始化使用 mkdir，文件权限按当前 OS 用户默认 ACL；�
 
 ### Windows 并发自动化
 
+- **M0 开工门槛，先于任何业务实现**：先写一次性/测试用的最小 Windows harness，只验证同卷 NTFS 上 `mkdir` mutex 的互斥与崩溃清理。8 个独立 `node.exe` 子进程经 barrier 同时启动，每个循环竞争 1,000 次；每次进入 mutex 后持有一个独立的排他 sentinel 探针一小段随机时长，再释放。探针必须独立记录任何重叠进入；总计 8,000 次竞争中重叠数必须为 0，子进程错误/超时为 0，最后残留 mutex 为 0。任一条件失败即停止 M0 后续实现，放弃目录 mutex 并重新设计；不得降低轮数或把失败解释为偶发。
+- 上述门槛覆盖本机并发互斥，不等同于已证明断电安全；单独杀死持锁子进程，确认后继进程能按 owner 身份规则恢复，损坏/无法识别 owner 时保持 fail closed。
 - 使用 `node:test` 启动多个独立 `node.exe` 子进程同时 claim 相同与不相交路径。相同路径测试要求恰好一个成功、其余退出 2，且每次运行的共享状态 schema 完整；不同路径可在同一短互斥区内顺序成功。
 - 用 barrier 文件/父进程管道同步竞争开始，循环高次数并记录错误码、claim 数和残留 mutex；不以线程测试替代多进程测试。
 - 专门测杀毒软件类暂时占用：由测试进程持有目标文件句柄/模拟 `EPERM`，检查有界重试、现场保留和诊断；此模拟不能替代真实 Defender/NTFS 压测。
 - 子进程在 mutex 写 owner 前后、claim 元数据写一半、lease 更新前后被 `taskkill /T /F` 终止；重启 doctor 后确认 `active/suspect/stale/corrupt` 分类与回收行为，并确认重复执行幂等。
 - 在 NTFS 临时仓库实际执行并发测试；CI 若可用 Windows runner，每次 PR 跑集成组。目录互斥、杀毒/索引器与 Node/Git 版本组合的结论以 Windows 测试记录为准。
 - 运行路径等价性矩阵：大小写差异、`/` 与 `\\`、`.`/`..`、8.3 短名、junction 内外、跨卷和非 NTFS 卷；所有无法证明安全等价或环境不满足的输入必须稳定退出 3。
+- 两条独立 lane 分别执行 `claim --file src/auth/login.ts`，必须使用相同逻辑键；第二条 claim 必须退出 2，且提示第一条 lane。重复覆盖 main + lane A/B 组合，不能要求两边 realpath 相等。
 - 运行 matcher 矩阵：精确文件、前缀根、前缀后代、两个重叠前缀、非法 `*`/`?`/`[]`/`{}`；确认不发生 shell 展开且冲突结果在 PowerShell 与 cmd 一致。
 - 验证 `status`/`brief`/`doctor`/`guard` 在写者持有 mutex 时的有界等待、owner 提示和退出码；确认 live 状态只通过 mutex 读取。
 

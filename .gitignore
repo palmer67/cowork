@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# build
+dist/
+build/
+*.tsbuildinfo
+
+# test / coverage
+coverage/
+.nyc_output/
+
+# logs
+*.log
+npm-debug.log*
+logs/
+
+# env
+.env
+.env.*
+!.env.example
+
+# editor / os
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# cowork 运行态（易失，不入库）
+# live 状态默认放在 <git-common-dir>/cowork/，此处为兜底
+.cowork/lanes/
+.cowork/live/

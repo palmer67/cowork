@@ -22,8 +22,8 @@ const HTML_ESCAPES: Record<string, string> = {
 };
 
 /** 所有进入 HTML 的数据都必须先过这里；面板是纯文本表格，不拼接任何 URL。 */
-export function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] ?? ch);
+export function escapeHtml(value: string | number): string {
+  return String(value).replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch] ?? ch);
 }
 
 function localTime(iso: string | null): string {
@@ -112,7 +112,7 @@ function renderClaims(claims: readonly SnapshotClaim[]): string {
   <td><span class="mono">${escapeHtml(claim.path)}</span></td>
   <td>${badge(claim.kind === 'prefix' ? '目录' : '文件')}</td>
   <td>${lane}</td>
-  <td>${escapeHtml(claim.agent)}<div class="sub mono">pid ${claim.pid}@${escapeHtml(claim.host)}</div></td>
+  <td>${escapeHtml(claim.agent)}<div class="sub mono">pid ${escapeHtml(claim.pid)}@${escapeHtml(claim.host)}</div></td>
   <td>${note}</td>
   <td>${expires}</td>
 </tr>`;

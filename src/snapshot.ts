@@ -279,12 +279,16 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
 
 /**
  * live 状态只在 mutex 内读，Git 只读命令都在锁外跑：临界区不能持锁跑 git。
- * 状态目录还不存在时没有 live 状态可读，也不该为了看一眼而把它建出来。
+ * 状态目录还不存在时用只读锁模式直接读空表，不为了看一眼把它建出来。
  */
 async function readClaims(info: RepoInfo): Promise<SnapshotClaim[]> {
   const state = stateRoot(info);
-  if (!existsSync(state)) return [];
-  const records = await withLock(state, () => listClaims(state));
+  // 一律先取锁再读；createStateDir=false 时目录不存在不会创建（见 mutex.ts）。
+  const records = await withLock(
+    state,
+    () => (existsSync(state) ? listClaims(state) : []),
+    { createStateDir: false },
+  );
   const now = Date.now();
   return records.map((rec) => ({
     path: rec.display,

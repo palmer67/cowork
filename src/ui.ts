@@ -227,7 +227,11 @@ ${refreshSeconds === undefined ? '' : `<meta http-equiv="refresh" content="${ref
 <div class="toolbar mono sub">
   <span title="仓库根">${escapeHtml(snap.repo.root)}</span>
   <span title="主工作树 HEAD，不一定是 trunk">主工作树 HEAD ${escapeHtml(head)}</span>
-  <span>生成于 ${escapeHtml(localTime(snap.generatedAt))}</span>
+  <span>${
+    refreshSeconds === undefined
+      ? `数据截至 ${escapeHtml(localTime(snap.generatedAt))}，进程停止后不会继续更新。`
+      : `数据截至 ${escapeHtml(localTime(snap.generatedAt))}，watch 每 ${refreshSeconds} 秒重写。`
+  }</span>
 </div>
 ${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分支 / 占位 / 交接…" aria-label="过滤表格">' : ''}
 <section class="card">
@@ -352,17 +356,29 @@ export async function watchPanel(info: RepoInfo, options: WatchPanelOptions): Pr
   // 用函数读取，避免 TS 把第一次检查后的类型收窄成 false|undefined。
   const aborted = (): boolean => options.signal?.aborted === true;
   let index = 0;
+  let lastFile: string | null = null;
   for (;;) {
     const snap = await takeSnapshot(info);
     const file = writePanel(info, snap, { out: options.out, refreshSeconds });
+    lastFile = file;
     index += 1;
     options.onWrite?.(file, snap, index);
     if (aborted()) break;
     await sleep(options.intervalMs, options.signal);
     if (aborted()) break;
   }
-  const final = await takeSnapshot(info);
-  return writePanel(info, final, { out: options.out });
+  // 收尾写失败（磁盘满、目录被删）只警告，不改变已经确定的退出状态。
+  try {
+    const final = await takeSnapshot(info);
+    return writePanel(info, final, { out: options.out });
+  } catch (err) {
+    console.warn(
+      `cowork: 退出前写入最终面板失败（页面可能仍保留自动刷新）: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return lastFile ?? (options.out === undefined ? panelPath(info) : path.resolve(options.out));
+  }
 }
 
 /** 只在用户显式 --open 时调用；失败不影响面板本身。 */

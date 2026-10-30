@@ -293,6 +293,7 @@ async function runUi(info: RepoInfo, args: Args): Promise<number> {
   const seconds = parseInterval(args.values.get('interval'));
   const controller = new AbortController();
   let stopping = false;
+  const fatal: Error[] = [];
   const stop = (): void => {
     if (stopping) return;
     stopping = true;
@@ -300,8 +301,20 @@ async function runUi(info: RepoInfo, args: Args): Promise<number> {
     console.log('正在停止 watch…');
     controller.abort();
   };
+  // 未捕获异常 / 未处理的 rejection 也先让 watch 写完不带 refresh 的最终版本再退。
+  const onFatal = (err: unknown): void => {
+    if (stopping) return;
+    stopping = true;
+    fatal.push(err instanceof Error ? err : new Error(String(err)));
+    console.log('');
+    console.log('watch 异常中断，正在写入最终面板…');
+    controller.abort();
+  };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
+  process.once('SIGHUP', stop);
+  process.on('uncaughtException', onFatal);
+  process.on('unhandledRejection', onFatal);
   try {
     const file = await watchPanel(info, {
       out,
@@ -314,11 +327,16 @@ async function runUi(info: RepoInfo, args: Args): Promise<number> {
         if (args.flags.has('open')) void openQuietly(panelFile);
       },
     });
+    const first = fatal[0];
+    if (first !== undefined) throw first;
     console.log(`已停止。面板: ${file}`);
     return EXIT.OK;
   } finally {
     process.off('SIGINT', stop);
     process.off('SIGTERM', stop);
+    process.off('SIGHUP', stop);
+    process.off('uncaughtException', onFatal);
+    process.off('unhandledRejection', onFatal);
   }
 }
 

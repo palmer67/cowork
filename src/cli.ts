@@ -606,6 +606,9 @@ async function runLane(info: RepoInfo, args: Args, rest: readonly string[]): Pro
   if (rest[0] !== 'new') {
     throw general(`未知 lane 子命令: ${rest[0] ?? '(空)'}`, '用法: cowork lane new <名> [--base <ref>]');
   }
+  if (args.flags.has('task')) {
+    throw general('lane new 不接受 --task', '任务用 cowork task add/ready 管理；lane 只建工作树。');
+  }
   const name = rest[1] ?? '';
   if (name === '') throw general('lane new 需要车道名', '例如: cowork lane new auth');
   const result = laneNew(info, name, value(args, 'base'));

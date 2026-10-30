@@ -339,7 +339,7 @@ function candidates(info: RepoInfo, catalog: TaskCatalog, world: World): Candida
     for (const touch of touches) {
       const owner = world.claims.find((record) => conflicts(touch, asClaimPath(record)));
       if (owner !== undefined) {
-        clash = `${formatClaim(touch)} 被 ${describeClaimOwner(owner)} 占着`;
+        clash = `${formatClaim(touch)} 与占位 ${formatClaim(asClaimPath(owner))} 冲突（${describeClaimOwner(owner)}）`;
         break;
       }
       for (const [id, live] of world.lives) {

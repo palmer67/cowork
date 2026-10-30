@@ -31,6 +31,19 @@
 4. **命令名不能叫 `wt`**（已被 Windows Terminal 占用）。
 5. Node ≥ 22，TypeScript strict。避免需要 MSVC 编译的原生依赖。
 
+## 占位的存活语义
+
+claim 的存活**只由 TTL 决定**，与进程 pid 无关：每次 `cowork claim` 都是一次独立的短命进程，
+用 pid 判断「agent 还在不在」会把刚占好的位当成残留清掉（M0 实测踩过，见 DECISIONS D7）。
+
+- 默认 TTL 24 小时，`COWORK_CLAIM_TTL_HOURS` 可覆盖；`cowork status` 显示过期时间
+- 过期后任何命令都会顺手回收；`cowork doctor --fix` 可立即清理
+- `cowork release` 只释放本工作树本 agent 的占位；确有 agent 崩溃时，由人运行
+  `cowork release --force <路径>`（会打印原占用者）
+- 两个 agent 共用一个工作树时，各自设 `COWORK_AGENT_ID=codex` / `COWORK_AGENT_ID=dsh`，
+  否则会被当成同一个 owner 而不互斥
+- claim 的事务语义：多个路径要么全部占上，要么一条都不写
+
 ## 代码约定
 
 - ESM，`node:` 前缀导入内建模块。

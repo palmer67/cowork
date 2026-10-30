@@ -87,7 +87,8 @@ test('枚举 .cowork/lanes 下的 worktree，排序并给出分支、HEAD 与采
   assert.equal(snap.schemaVersion, 1);
   assert.deepEqual(
     snap.lanes.map((lane) => lane.lane),
-    ['alpha', 'beta', 'detach', 'gone'],
+    [null, 'alpha', 'beta', 'detach', 'gone'],
+    '主工作树（lane=null）排在最前，其余按目录名排序',
   );
   assert.equal(
     realpathSync.native(snap.repo.root).toLowerCase(),
@@ -116,6 +117,27 @@ test('dirty 与文件数按该车道工作区统计：alpha 干净，beta 含重
   assert.equal(beta.changed_file_count, 3, 'staged rename + modified + untracked 共 3 个路径');
 });
 
+test('主工作树作为 lane=null 的一条纳入，未提交改动照常统计', async () => {
+  const clean = await snapshot(info);
+  const main = clean.lanes[0];
+  assert.ok(main !== undefined);
+  assert.equal(main.lane, null);
+  assert.equal(main.branch, 'main');
+  assert.equal(main.dirty, false);
+  assert.equal(main.changed_file_count, 0);
+
+  try {
+    writeFileSync(path.join(root, 'README.md'), '# test\n\n主工作树改动\n', 'utf8');
+    const dirty = await snapshot(info);
+    const changed = dirty.lanes[0];
+    assert.ok(changed !== undefined);
+    assert.equal(changed.dirty, true, '主工作树（Codex 正在这里干活）的未提交改动必须可见');
+    assert.equal(changed.changed_file_count, 1);
+  } finally {
+    git(['checkout', '--', 'README.md'], root);
+  }
+});
+
 test('detached HEAD 时 branch 为 null，最近交接全为 null', async () => {
   const snap = await snapshot(info);
   const detach = laneOf(snap.lanes, 'detach');
@@ -132,7 +154,7 @@ test('detached HEAD 时 branch 为 null，最近交接全为 null', async () => 
 test('worktree 目录缺失时给 error，不可得字段是 null 而不是干净', async () => {
   const snap = await snapshot(info);
   const gone = laneOf(snap.lanes, 'gone');
-  assert.ok(gone.error?.includes('车道目录不存在'), gone.error);
+  assert.ok(gone.error?.includes('目录不存在'), gone.error);
   assert.equal(gone.dirty, null);
   assert.equal(gone.changed_file_count, null);
   assert.equal(gone.last_handoff.id, null);

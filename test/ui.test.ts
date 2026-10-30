@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { CoworkError, EXIT } from '../src/errors.ts';
 import type { RepoInfo } from '../src/git.ts';
 import type { Snapshot, SnapshotHandoff, SnapshotLane } from '../src/snapshot.ts';
-import { escapeHtml, panelPath, renderPanel, writePanel } from '../src/ui.ts';
+import { escapeHtml, panelPath, renderPanel, watchPanel, writePanel } from '../src/ui.ts';
 
 const NO_HANDOFF: SnapshotHandoff = {
   id: null,
@@ -15,6 +16,15 @@ const NO_HANDOFF: SnapshotHandoff = {
 };
 
 const lanes: SnapshotLane[] = [
+  {
+    lane: null,
+    branch: 'main',
+    head: '1111111',
+    observed_at: '2026-10-30T08:00:00.000Z',
+    dirty: false,
+    changed_file_count: 0,
+    last_handoff: NO_HANDOFF,
+  },
   {
     lane: 'alpha',
     branch: 'feat/alpha',
@@ -115,20 +125,20 @@ test('面板数据全部转义：占位备注、交接标题、错误信息都�
 
 test('面板呈现车道状态、未提交数量、detached 与过期占位', () => {
   const html = renderPanel(snap);
-  assert.ok(html.includes('3 条，1 条有未提交改动'), '车道计数与 dirty 数');
+  assert.ok(html.includes('4 条，1 条有未提交改动'), '工作树计数与 dirty 数');
   assert.ok(html.includes('3 个文件'), 'beta 的变更文件数');
   assert.ok(html.includes('干净'), '干净车道');
+  assert.ok(html.includes('(main)'), '主工作树行与它的占位都用 (main) 标出');
   assert.ok(html.includes('detached'), 'detached HEAD 标记');
   assert.ok(html.includes('2 个，其中 1 个已过期'), '占位计数与过期数');
   assert.ok(html.includes('已过期'), '过期占位标记');
-  assert.ok(html.includes('(主工作树)'), '全局占位的车道列');
 });
 
 test('空仓库面板不渲染过滤器，并给出空态说明', () => {
   const html = renderPanel(EMPTY);
   assert.ok(!html.includes('id="filter"'), '没有行时不需要过滤器');
   assert.ok(!html.includes('document.getElementById'), '没有行时不注入过滤脚本');
-  assert.ok(html.includes('没有登记的车道。'));
+  assert.ok(html.includes('没有可读的工作树。'));
   assert.ok(html.includes('当前没有占位。'));
   assert.ok(html.includes('任务层还没实现'));
 });
@@ -159,5 +169,75 @@ test('panelPath 按 commonDir 稳定，writePanel 落盘且内容与渲染一致
     rmSync(direct, { force: true });
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('只有 --watch 渲染 meta refresh，静态面板不自我重载', () => {
+  assert.ok(!renderPanel(snap).includes('http-equiv="refresh"'), '静态面板不应自动重载');
+  const watched = renderPanel(snap, { refreshSeconds: 2 });
+  assert.ok(watched.includes('<meta http-equiv="refresh" content="2">'));
+  assert.ok(watched.includes('每 2 秒自动刷新'));
+  assert.ok(watched.includes('Ctrl+C 停止 watch'));
+});
+
+test('watchPanel 循环重写同一文件，退出后去掉 refresh，且不留临时文件', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'cowork-watch-'));
+  try {
+    const out = path.join(dir, 'panel.html');
+    const info: RepoInfo = {
+      mainRoot: 'D:\\repo',
+      laneTop: 'D:\\repo',
+      commonDir: 'D:\\repo\\.git',
+      laneName: null,
+    };
+    const controller = new AbortController();
+    const ticks: string[] = [];
+    let sequence = 0;
+    const file = await watchPanel(info, {
+      out,
+      intervalMs: 20,
+      signal: controller.signal,
+      source: async () => {
+        sequence += 1;
+        return { ...snap, generatedAt: `2026-10-30T08:00:0${sequence}.000Z` };
+      },
+      onWrite: (_file, _tick, index) => {
+        ticks.push(`tick-${index}`);
+        if (index === 2) controller.abort();
+      },
+    });
+    assert.equal(file, out);
+    assert.deepEqual(ticks, ['tick-1', 'tick-2']);
+    const html = readFileSync(out, 'utf8');
+    assert.ok(html.includes('4 条'), '写出的确实是面板');
+    assert.ok(!html.includes('http-equiv="refresh"'), 'watch 停掉后页面不应继续自动重载');
+    assert.deepEqual(
+      readdirSync(dir).filter((name) => name.includes('.tmp-')),
+      [],
+      '原子写的临时文件必须清理干净',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('写不出面板文件时按退出码 3（环境不满足）报错', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'cowork-ui-err-'));
+  try {
+    // 父路径是同名文件：mkdir 必然失败，模拟不可写目标。
+    const blocker = path.join(dir, 'blocker');
+    writeFileSync(blocker, 'x', 'utf8');
+    const info: RepoInfo = {
+      mainRoot: 'D:\\repo',
+      laneTop: 'D:\\repo',
+      commonDir: 'D:\\repo\\.git',
+      laneName: null,
+    };
+    assert.throws(
+      () => writePanel(info, snap, { out: path.join(blocker, 'panel.html') }),
+      (err: unknown) => err instanceof CoworkError && err.code === EXIT.ENV,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

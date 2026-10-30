@@ -6,7 +6,7 @@ import { CoworkError, EXIT, general } from './errors.ts';
 import { currentBranch, headCommit, repoInfo, type RepoInfo } from './git.ts';
 import { snapshot, type Snapshot } from './snapshot.ts';
 import { stateRoot, type ClaimRecord } from './store.ts';
-import { openPanel, writePanel } from './ui.ts';
+import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 
 const USAGE = `cowork — 多 agent 同仓协作纪律层
 
@@ -17,7 +17,9 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork status [--json]          查看当前全部占位
   cowork snapshot [--json]        只读快照：车道、未提交改动与占位
   cowork ui [--out <路径>] [--open]
-                                  生成只读看板（静态 HTML，不监听端口）
+  cowork ui --watch [--interval <秒>]
+                                  生成只读看板（静态 HTML，不监听端口）；
+                                  --watch 前台重写，Ctrl+C 退出，默认 2 秒
   cowork doctor [--fix]           检查状态目录与残留占位
   cowork version                  版本
 
@@ -30,8 +32,8 @@ interface Args {
   values: Map<string, string>;
 }
 
-/** 只需要 `--flag`、`--key=value` 和值型 flag（`--note <文本>`、`--out <路径>`）。 */
-const VALUE_FLAGS = new Set(['note', 'out']);
+/** 只需要 `--flag`、`--key=value` 和值型 flag（`--note <文本>`、`--out <路径>`、`--interval <秒>`）。 */
+const VALUE_FLAGS = new Set(['note', 'out', 'interval']);
 
 function parseArgs(argv: readonly string[]): Args {
   const [command = '', ...tail] = argv;
@@ -200,14 +202,14 @@ function printSnapshot(snap: Snapshot): void {
   console.log(`生成于: ${stamp(snap.generatedAt)}`);
   console.log('');
   if (snap.lanes.length === 0) {
-    console.log('车道: 没有登记的车道（.cowork/lanes/ 下还没有 worktree）。');
+    console.log('工作树: 没有可读的工作树（git worktree list 为空）。');
   } else {
-    const laneWidth = Math.min(Math.max(...snap.lanes.map((l) => l.lane.length), 4), 24);
+    const laneWidth = Math.min(Math.max(...snap.lanes.map((l) => (l.lane ?? '(main)').length), 4), 24);
     const branchWidth = Math.min(
       Math.max(...snap.lanes.map((l) => (l.branch ?? 'detached').length), 6),
       28,
     );
-    console.log(`车道 (${snap.lanes.length}):`);
+    console.log(`工作树 (${snap.lanes.length}):`);
     for (const lane of snap.lanes) {
       const changes =
         lane.dirty === null
@@ -220,7 +222,7 @@ function printSnapshot(snap: Snapshot): void {
           ? '—'
           : `${lane.last_handoff.id}（${stamp(lane.last_handoff.created_at)}）`;
       console.log(
-        `  ${lane.lane.padEnd(laneWidth)}  ${(lane.branch ?? 'detached').padEnd(branchWidth)}  ${lane.head ?? '?'}  ${changes.padEnd(8)}  最近交接 ${handoff}`,
+        `  ${(lane.lane ?? '(main)').padEnd(laneWidth)}  ${(lane.branch ?? 'detached').padEnd(branchWidth)}  ${lane.head ?? '?'}  ${changes.padEnd(8)}  最近交接 ${handoff}`,
       );
       if (lane.error !== undefined) console.log(`  ↳ ${lane.error}`);
     }
@@ -250,20 +252,74 @@ async function runSnapshot(info: RepoInfo, json: boolean): Promise<number> {
   return EXIT.OK;
 }
 
-async function runUi(info: RepoInfo, args: Args): Promise<number> {
-  const snap = await snapshot(info);
-  const file = writePanel(info, snap, { out: args.values.get('out') });
-  console.log(file);
-  console.log('面板已生成；重新运行 cowork ui 可刷新，浏览器刷新页面即可看到新数据。');
-  if (args.flags.has('open')) {
-    try {
-      await openPanel(file);
-    } catch (err) {
-      console.warn(`cowork: 无法自动打开浏览器: ${err instanceof Error ? err.message : String(err)}`);
-      console.warn('  → 面板已生成，直接打开上面的路径即可。');
-    }
+function parseInterval(raw: string | undefined): number {
+  if (raw === undefined) return DEFAULT_WATCH_INTERVAL_MS / 1000;
+  if (!/^\d+$/.test(raw)) {
+    throw general(`--interval 需要整数秒: ${raw}`, '例如: cowork ui --watch --interval 2');
   }
-  return EXIT.OK;
+  const seconds = Number(raw);
+  if (seconds < 1 || seconds > 3600) {
+    throw general(`--interval 超出范围: ${seconds}`, '取值 1..3600 秒；meta refresh 只支持整秒。');
+  }
+  return seconds;
+}
+
+async function openQuietly(file: string): Promise<void> {
+  try {
+    await openPanel(file);
+  } catch (err) {
+    console.warn(`cowork: 无法自动打开浏览器: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn('  → 面板已生成，直接打开上面的路径即可。');
+  }
+}
+
+async function runUi(info: RepoInfo, args: Args): Promise<number> {
+  const out = args.values.get('out');
+  const watching = args.flags.has('watch');
+  if (!watching && args.values.has('interval')) {
+    throw general('--interval 只能和 --watch 一起用', '用法: cowork ui --watch [--interval <秒>]');
+  }
+
+  if (!watching) {
+    const snap = await snapshot(info);
+    const file = writePanel(info, snap, { out });
+    console.log(file);
+    console.log('面板已生成；重新运行 cowork ui 可刷新，浏览器刷新页面即可看到新数据。');
+    console.log('想开着自动刷新: cowork ui --watch（Ctrl+C 退出）。');
+    if (args.flags.has('open')) await openQuietly(file);
+    return EXIT.OK;
+  }
+
+  const seconds = parseInterval(args.values.get('interval'));
+  const controller = new AbortController();
+  let stopping = false;
+  const stop = (): void => {
+    if (stopping) return;
+    stopping = true;
+    console.log('');
+    console.log('正在停止 watch…');
+    controller.abort();
+  };
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try {
+    const file = await watchPanel(info, {
+      out,
+      intervalMs: seconds * 1000,
+      signal: controller.signal,
+      onWrite: (panelFile, _snap, index) => {
+        if (index !== 1) return;
+        console.log(panelFile);
+        console.log(`watch 模式：每 ${seconds} 秒重写一次，Ctrl+C 退出。`);
+        if (args.flags.has('open')) void openQuietly(panelFile);
+      },
+    });
+    console.log(`已停止。面板: ${file}`);
+    return EXIT.OK;
+  } finally {
+    process.off('SIGINT', stop);
+    process.off('SIGTERM', stop);
+  }
 }
 
 async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {

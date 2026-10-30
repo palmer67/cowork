@@ -17,8 +17,11 @@ export interface SnapshotHandoff {
 }
 
 export interface SnapshotLane {
-  /** 车道目录名（相对 .cowork/lanes/），不是分支名。 */
-  lane: string;
+  /**
+   * 车道目录名（相对 .cowork/lanes/），不是分支名；
+   * null 表示主工作树（面板显示 (main)），与 ClaimRecord.lane 的约定一致。
+   */
+  lane: string | null;
   /** detached HEAD 时为 null。 */
   branch: string | null;
   head: string | null;
@@ -139,9 +142,16 @@ function normalizeTime(raw: string | null): string | null {
 
 /** 读该车道工作树里可见（含未提交）的交接单；坏文件跳过，不影响整份快照。 */
 function readHandoffs(notesDir: string): HandoffMeta[] {
-  if (!existsSync(notesDir)) return [];
+  let names: string[];
+  try {
+    names = readdirSync(notesDir);
+  } catch {
+    // 目录存在但读不了（权限、被杀软锁住、或同名文件）时只跳过这条车道，
+    // 不拖垮整份快照——一条车道坏了不该让面板整个挂掉。
+    return [];
+  }
   const out: HandoffMeta[] = [];
-  for (const name of readdirSync(notesDir)) {
+  for (const name of names) {
     if (!name.endsWith('.md')) continue;
     const file = path.join(notesDir, name);
     let text: string;
@@ -196,15 +206,20 @@ function emptyHandoff(): SnapshotHandoff {
 /** 交接单上的 lane 可能是目录名，也可能是分支名（如 dsh/m0），两者都匹配。 */
 function latestHandoff(
   metas: readonly HandoffMeta[],
-  lane: string,
+  lane: string | null,
   branch: string | null,
 ): SnapshotHandoff {
-  const matching = metas.filter(
-    (meta) => meta.lane === lane || (branch !== null && meta.lane === branch),
-  );
+  const matching = metas.filter((meta) => {
+    // 主工作树没有车道目录名，只能按分支匹配。
+    if (lane !== null && meta.lane === lane) return true;
+    return branch !== null && meta.lane === branch;
+  });
   matching.sort((a, b) => {
-    const byTime = timeValue(b.created_at) - timeValue(a.created_at);
-    return byTime !== 0 ? byTime : b.id.localeCompare(a.id);
+    const left = timeValue(a.created_at);
+    const right = timeValue(b.created_at);
+    // 两边都无有效时间时不能用减法：-Infinity - (-Infinity) 是 NaN，排序结果未定义。
+    if (left !== right) return right - left;
+    return b.id.localeCompare(a.id);
   });
   const best = matching[0];
   if (best === undefined) return emptyHandoff();
@@ -221,7 +236,7 @@ function attempt(args: string[], cwd: string): GitAttempt {
   }
 }
 
-function observeLane(worktree: Worktree, lane: string): SnapshotLane {
+function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
   const lanePath = path.resolve(worktree.path);
   const entry: SnapshotLane = {
     lane,
@@ -234,7 +249,7 @@ function observeLane(worktree: Worktree, lane: string): SnapshotLane {
   };
   if (!existsSync(lanePath)) {
     entry.observed_at = new Date().toISOString();
-    entry.error = `车道目录不存在（worktree 登记仍在）: ${lanePath}`;
+    entry.error = `工作树目录不存在（worktree 登记仍在）: ${lanePath}`;
     return entry;
   }
 
@@ -286,6 +301,13 @@ async function readClaims(info: RepoInfo): Promise<SnapshotClaim[]> {
   }));
 }
 
+/** Windows 路径大小写不敏感；用于识别主工作树。 */
+function samePath(a: string, b: string): boolean {
+  const left = path.resolve(a);
+  const right = path.resolve(b);
+  return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
 /** 面板唯一数据源；只读，不写 claims，也不创建状态目录。 */
 export async function snapshot(info: RepoInfo): Promise<Snapshot> {
   const claims = await readClaims(info);
@@ -293,12 +315,20 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
   const lanesRoot = path.join(info.mainRoot, '.cowork', 'lanes');
   const lanes: SnapshotLane[] = [];
   for (const worktree of listWorktrees(info.mainRoot)) {
-    const resolved = path.resolve(worktree.path);
-    const rel = path.relative(lanesRoot, resolved);
+    // 主工作树也是一条工作树：Codex 之类在主工作树干活时，未提交改动同样要看得见。
+    if (samePath(worktree.path, info.mainRoot)) {
+      lanes.push(observeLane(worktree, null));
+      continue;
+    }
+    const rel = path.relative(lanesRoot, path.resolve(worktree.path));
     if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
     lanes.push(observeLane(worktree, rel.split(path.sep).join('/')));
   }
-  lanes.sort((a, b) => a.lane.localeCompare(b.lane));
+  lanes.sort((a, b) => {
+    if (a.lane === null) return b.lane === null ? 0 : -1;
+    if (b.lane === null) return 1;
+    return a.lane.localeCompare(b.lane);
+  });
 
   return {
     schemaVersion: 1,

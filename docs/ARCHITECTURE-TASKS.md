@@ -177,7 +177,9 @@ assessParallel(
 
 每条 lane 至少输出 `branch`、`head`、`dirty`、`changed_file_count`、最近一次 handoff 的 `id` 与 `created_at`；`dirty` 和文件数以该 lane worktree 的 `git status --porcelain` 为准，统计暂存、未暂存、删除、重命名和未跟踪路径，按路径去重，重命名的一对旧/新路径按一个变更项计，文件数为 0 时 `dirty=false`。handoff 没有则 `id` 与 `created_at` 都为 `null`。命令先通过基础 mutex 获取一致 live 快照，再对各 lane 调用 Git 只读命令并完整序列化到 stdout；每个 lane 的 Git 字段附 `observed_at`，说明采样时间，不承诺所有 lane 与 live 状态来自完全相同瞬间。只读，无写入副作用。JSON schema 版本化；面板不可直接读取或修改 `.git/cowork`，也不能成为第二写者。
 
-文件统计用 `git status --porcelain=v1 -z --untracked-files=all` 结构化解析，重命名算一个变更文件；Git 忽略项不计入。最近 handoff 从该 lane 可达的 `.cowork/notes/` 加上本地未提交 handoff 中筛选 `lane` 匹配者，按元数据时间倒序、id 作为同时间排序键，故新交接不必等待合并到 trunk 才可展示。lane detached HEAD 时 `branch=null`，缺失 worktree/读取失败时增加 `error`，将不可得的字段设为 `null`，不能伪装为 `dirty=false`、文件数 0。
+文件统计用 `git status --porcelain=v1 -z --untracked-files=all` 结构化解析，重命名算一个变更文件；Git 忽略项不计入。Git 调用带 `-c core.longpaths=true`（Windows 长路径），仍失败时给 `error` 并保持 `dirty`/文件数为 `null`，不能降级成“干净”。最近 handoff 从该 lane 可达的 `.cowork/notes/` 加上本地未提交 handoff 中筛选 `lane` 匹配者，按元数据时间倒序、id 作为同时间排序键，故新交接不必等待合并到 trunk 才可展示。lane detached HEAD 时 `branch=null`，缺失 worktree/读取失败时增加 `error`，将不可得的字段设为 `null`，不能伪装为 `dirty=false`、文件数 0。
+
+交接单读取失败同样不能静默：`handoff_diagnostics` 逐条列出文件级原因（缺 `---` front matter、JSON 不合法、不是对象、缺 `lane`、单文件不可读、目录不可读及其系统消息）。交接目录整体不可读时该 lane 额外带 `error`；坏的只是部分文件时保留仍可解析的最近交接，把坏文件列进诊断，而不是显示成“没有交接”。
 
 主工作树本身不在 `.cowork/lanes/` 下，但同样有人（如 Codex）在里面直接改文件，所以也作为一条记录输出：`lane` 为 `null`、面板显示为 `(main)`，排在其它 lane 之前，`dirty`/`changed_file_count`/`last_handoff` 语义相同（主工作树的最近 handoff 只按分支名匹配）。这样 `git worktree list` 里的每条工作树都在快照里有对应行，不会出现"改动看不见"的盲区。
 

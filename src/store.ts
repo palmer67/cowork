@@ -99,5 +99,5 @@ export function listClaims(state: string): ClaimRecord[] {
 }
 
 export function asClaimPath(record: ClaimRecord): ClaimPath {
-  return { kind: record.kind, key: record.key };
+  return { kind: record.kind, key: record.key, display: record.display };
 }

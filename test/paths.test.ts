@@ -37,17 +37,22 @@ test('精确文件路径归一化：分隔符、前导 ./、大小写', () => {
   assert.equal(a.kind, 'file');
   assert.equal(a.key, 'src/auth/login.ts');
 
-  const b = parseClaim('.\\src\\auth\\login.ts', info);
-  assert.deepEqual(b, a);
+  const winStyle = './' + ['src', 'auth', 'login.ts'].join(String.fromCharCode(92));
+  const b = parseClaim(winStyle, info);
+  assert.equal(b.key, a.key, '反斜杠与前导 ./ 都要归一化');
+  assert.equal(b.kind, a.kind);
 
   const c = parseClaim('SRC/Auth/Login.ts', info);
-  assert.deepEqual(c, a, '大小写折叠后应与原路径相同');
+  assert.equal(c.key, a.key, '大小写折叠后冲突键应相同');
+  assert.equal(c.display, 'SRC/Auth/Login.ts', '展示形式保留用户输入的大小写');
 });
 
 test('目录与 /** 都解析为前缀', () => {
-  assert.deepEqual(parseClaim('src/auth', info), { kind: 'prefix', key: 'src/auth' });
-  assert.deepEqual(parseClaim('src/auth/**', info), { kind: 'prefix', key: 'src/auth' });
-  assert.deepEqual(parseClaim('src/auth/', info), { kind: 'prefix', key: 'src/auth' });
+  for (const input of ['src/auth', 'src/auth/**', 'src/auth/']) {
+    const parsed = parseClaim(input, info);
+    assert.equal(parsed.kind, 'prefix', input);
+    assert.equal(parsed.key, 'src/auth', input);
+  }
 });
 
 test('拒绝绝对路径、盘符、UNC、.. 逃逸与仓库根', () => {
@@ -81,5 +86,5 @@ test('同一相对路径在两条车道里必须得到同一个 key', () => {
   mkdirSync(path.join(laneRoot, 'src', 'auth'), { recursive: true });
   writeFileSync(path.join(laneRoot, 'src', 'auth', 'login.ts'), 'export {}\n', 'utf8');
   const laneInfo: RepoInfo = { laneTop: laneRoot, commonDir: info.commonDir, mainRoot: root, laneName: 'b' };
-  assert.deepEqual(parseClaim('src/auth/login.ts', laneInfo), parseClaim('src/auth/login.ts', info));
+  assert.equal(parseClaim('src/auth/login.ts', laneInfo).key, parseClaim('src/auth/login.ts', info).key);
 });

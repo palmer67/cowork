@@ -12,7 +12,10 @@ export type ClaimKind = 'file' | 'prefix';
  */
 export interface ClaimPath {
   kind: ClaimKind;
+  /** 冲突键：小写折叠，只用于比较。 */
   key: string;
+  /** 展示形式：保留用户输入的大小写，用于输出与快照。 */
+  display: string;
 }
 
 const DRIVE = /^[A-Za-z]:/;
@@ -38,7 +41,7 @@ export function conflicts(a: ClaimPath, b: ClaimPath): boolean {
 }
 
 export function formatClaim(p: ClaimPath): string {
-  return p.kind === 'prefix' ? `${p.key}/**` : p.key;
+  return p.kind === 'prefix' ? `${p.display}/**` : p.display;
 }
 
 function statIsDir(abs: string): boolean {
@@ -131,7 +134,7 @@ export function parseClaim(input: string, info: RepoInfo): ClaimPath {
     );
   }
 
-  return { kind, key: real.toLowerCase() };
+  return { kind, key: real.toLowerCase(), display: key0 };
 }
 
 export function claimPathsEqual(a: ClaimPath, b: ClaimPath): boolean {

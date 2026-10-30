@@ -209,6 +209,7 @@ cowork doctor [--fix]
 
 ## 12. 待用户确认
 
-- 第一个接入的仓库路径（当前 `default-workspace` 不是 git 仓库）。
+- ~~第一个接入的仓库路径~~ 已定：cowork 自身，仓库已从 `default-workspace` 迁到
+  `deepseek-harness\cowork`，并对应一个独立的 DSH 工作区。
 - 工具名是否用 `cowork`（已排除 `wt`）。
 - 是否接受"live 状态放在 `.git/cowork/`"（人不可见，但最干净）。

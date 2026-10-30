@@ -37,15 +37,16 @@ function leaseProblems(info: RepoInfo, catalog: TaskCatalog, lives: readonly Tas
       continue;
     }
     if (live.spec_commit !== null) {
-      const ancestor = gitTry(
-        ['merge-base', '--is-ancestor', live.spec_commit, catalog.trunk],
-        info.mainRoot,
-      );
-      if (ancestor === null) {
+      // 只比祖先不够：正常前进后改写同一份 spec，旧 commit 仍是祖先。
+      // 直接比 lease 记录那次提交里的 spec blob 与 trunk 现在的内容一致。
+      const rel = `.cowork/tasks/${live.id}.md`;
+      const atLease = gitTry(['rev-parse', `${live.spec_commit}:${rel}`], info.mainRoot);
+      const atTrunk = gitTry(['rev-parse', `${catalog.trunk}:${rel}`], info.mainRoot);
+      if (atLease === null || atTrunk === null || atLease !== atTrunk) {
         problems.push(
           describeProblem(
             file,
-            `lease 的 spec_commit ${live.spec_commit.slice(0, 7)} 不在 ${catalog.trunk} 历史里（spec 可能被改写）`,
+            `lease 的 spec 内容已漂移（${live.spec_commit.slice(0, 7)} 与 ${catalog.trunk} 上的 ${live.id}.md 不同）`,
             '先 cowork task cancel，再从 trunk 重新 ready',
           ),
         );
@@ -106,7 +107,14 @@ function fixPass(info: RepoInfo, state: string, catalog: TaskCatalog, fixed: str
   const claims = listClaims(state);
   for (const live of states.lives) {
     if (!LEASE_STATUSES.has(live.status)) continue;
-    const alive = claims.some((claim) => claim.agentId === live.agent && !isExpired(claim, Date.now()));
+    // 只看本任务自己写下的占位：同 agent 跑别的任务时，不能把那条 claim 当成本 lease 的。
+    const alive = claims.some(
+      (claim) =>
+        claim.agentId === live.agent &&
+        claim.note === `task ${live.id}` &&
+        claim.lane === live.lane &&
+        !isExpired(claim, Date.now()),
+    );
     if (alive) continue;
     writeTaskLive(state, {
       ...live,

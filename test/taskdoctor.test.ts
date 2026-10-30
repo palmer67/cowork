@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { claimTtlMs } from '../src/claims.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
-import { ensureState, stateRoot } from '../src/store.ts';
+import { parseClaim } from '../src/paths.ts';
+import { claimId, ensureState, stateRoot, writeClaim } from '../src/store.ts';
 import { readTaskLive, transitionTask } from '../src/taskstore.ts';
 import { doctorTasks } from '../src/taskdoctor.ts';
 import { writeIntent, type NextIntent } from '../src/tasknext.ts';
@@ -180,7 +182,7 @@ test('过期 lease（没有对应占位）被 --fix 回收为 ready', async () =
       specCommit: 'deadbeef'.repeat(5),
     });
     const before = await doctorTasks(fixture.info, false);
-    assert.ok(before.problems.some((line) => line.includes('不在 main 历史')), before.problems.join(' | '));
+    assert.ok(before.problems.some((line) => line.includes('内容已漂移')), before.problems.join(' | '));
 
     const fix = await doctorTasks(fixture.info, true);
     assert.ok(fix.fixed.some((line) => line.includes('已回收过期 lease')), fix.fixed.join(' | '));
@@ -189,6 +191,75 @@ test('过期 lease（没有对应占位）被 --fix 回收为 ready', async () =
     assert.equal(live?.agent, null);
     const after = await doctorTasks(fixture.info, false);
     assert.deepEqual(after.problems, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('lease 之后改写同一份 spec，祖先检查会漏，blob 比较能报出来', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  try {
+    ensureState(fixture.state);
+    transitionTask(fixture.state, 't-00a1b2', 'ready');
+    const leaseCommit = git(['rev-parse', 'HEAD'], fixture.root);
+    transitionTask(fixture.state, 't-00a1b2', 'claimed', {
+      lane: null,
+      lanePath: fixture.info.laneTop,
+      agent: 'dsh',
+      specCommit: leaseCommit,
+    });
+
+    // 正常前进：把 spec 的 done_when 改掉并提交，旧 commit 仍是 HEAD 的祖先。
+    writeFileSync(
+      path.join(fixture.root, '.cowork', 'tasks', 't-00a1b2.md'),
+      specText(meta('t-00a1b2', { done_when: ['changed'] })),
+      'utf8',
+    );
+    git(['add', '.'], fixture.root);
+    git(['commit', '-qm', 'rewrite spec'], fixture.root);
+
+    const report = await doctorTasks(fixture.info, false);
+    assert.ok(
+      report.problems.some((line) => line.includes('内容已漂移')),
+      report.problems.join(' | '),
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('同 agent 跑别的任务留下的 claim 不能让 lease 保活', async () => {
+  const fixture = makeRepo([meta('t-00a1b2'), meta('t-00b3c4')]);
+  try {
+    ensureState(fixture.state);
+    transitionTask(fixture.state, 't-00a1b2', 'ready');
+    const head = git(['rev-parse', 'HEAD'], fixture.root);
+    transitionTask(fixture.state, 't-00a1b2', 'claimed', {
+      lane: null,
+      lanePath: fixture.info.laneTop,
+      agent: 'dsh',
+      specCommit: head,
+    });
+    const other = parseClaim('src/t-00b3c4.ts', fixture.info);
+    writeClaim(fixture.state, {
+      id: claimId(other),
+      kind: other.kind,
+      key: other.key,
+      display: 'src/t-00b3c4.ts',
+      lane: null,
+      lanePath: fixture.info.laneTop,
+      branch: 'main',
+      agentId: 'dsh',
+      pid: process.pid,
+      host: hostname(),
+      note: 'task t-00b3c4',
+      createdAt: new Date().toISOString(),
+      ttlMs: claimTtlMs(),
+    });
+
+    const fix = await doctorTasks(fixture.info, true);
+    assert.ok(fix.fixed.some((line) => line.includes('已回收过期 lease t-00a1b2')), fix.fixed.join(' | '));
+    assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'ready');
   } finally {
     fixture.cleanup();
   }

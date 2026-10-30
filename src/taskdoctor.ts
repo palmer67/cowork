@@ -2,6 +2,7 @@ import { mkdirSync, renameSync } from 'node:fs';
 import path from 'node:path';
 import { isExpired } from './claims.ts';
 import { gitTry, type RepoInfo } from './git.ts';
+import { withLock } from './mutex.ts';
 import { listClaims, stateRoot } from './store.ts';
 import {
   listTaskLiveStates,
@@ -80,61 +81,66 @@ function specProblems(catalog: TaskCatalog): string[] {
   return problems;
 }
 
-/** 只读检查（--fix 时先修再查）。返回 problems 非空即 doctor 退出 1。 */
-export async function doctorTasks(info: RepoInfo, fix: boolean): Promise<TaskDoctorReport> {
-  const fixed: string[] = [];
-  if (fix) {
-    const state = stateRoot(info);
-    const intents = listIntents(state);
-    if (intents.length > 0) {
-      const recovery = recoverIntents(state);
-      for (const id of [...recovery.recovered, ...recovery.cleaned]) fixed.push(`已回滚未完成事务 ${id}`);
-      for (const id of recovery.corrupt) fixed.push(`事务 ${id} 未能回滚（见 doctor 输出）`);
-    }
+/** --fix 的所有写操作；调用方必须在全局锁内执行。 */
+function fixPass(info: RepoInfo, state: string, catalog: TaskCatalog, fixed: string[]): void {
+  const intents = listIntents(state);
+  if (intents.length > 0) {
+    const recovery = recoverIntents(state);
+    for (const id of [...recovery.recovered, ...recovery.cleaned]) fixed.push(`已回滚未完成事务 ${id}`);
+    for (const id of recovery.corrupt) fixed.push(`事务 ${id} 未能回滚（见 doctor 输出）`);
+  }
 
-    const states = listTaskLiveStates(state);
-    for (const item of states.corrupt) {
-      const trashDir = path.join(state, 'trash');
-      mkdirSync(trashDir, { recursive: true });
-      const target = path.join(trashDir, `task-${item.id}-${Date.now()}.json`);
-      try {
-        renameSync(item.file, target);
-        fixed.push(`已隔离损坏 live ${item.file} → ${target}`);
-      } catch {
-        // 隔离失败保留原文件，检查阶段仍会报出来。
-      }
-    }
-
-    const catalog = readTrunkCatalog(info);
-    const claims = listClaims(state);
-    for (const live of states.lives) {
-      if (!LEASE_STATUSES.has(live.status)) continue;
-      const alive = claims.some((claim) => claim.agentId === live.agent && !isExpired(claim, Date.now()));
-      if (alive) continue;
-      writeTaskLive(state, {
-        ...live,
-        status: 'ready',
-        lane: null,
-        lanePath: null,
-        agent: null,
-        updated_at: new Date().toISOString(),
-        history: [
-          ...live.history,
-          {
-            at: new Date().toISOString(),
-            from: live.status,
-            to: 'ready',
-            agent: 'doctor',
-            note: 'lease 过期或无对应占位，回收为 ready',
-          },
-        ],
-      });
-      fixed.push(`已回收过期 lease ${live.id}（${catalog.trunk}）`);
+  const states = listTaskLiveStates(state);
+  for (const item of states.corrupt) {
+    const trashDir = path.join(state, 'trash');
+    mkdirSync(trashDir, { recursive: true });
+    const target = path.join(trashDir, `task-${item.id}-${Date.now()}.json`);
+    try {
+      renameSync(item.file, target);
+      fixed.push(`已隔离损坏 live ${item.file} → ${target}`);
+    } catch {
+      // 隔离失败保留原文件，检查阶段仍会报出来。
     }
   }
 
+  const claims = listClaims(state);
+  for (const live of states.lives) {
+    if (!LEASE_STATUSES.has(live.status)) continue;
+    const alive = claims.some((claim) => claim.agentId === live.agent && !isExpired(claim, Date.now()));
+    if (alive) continue;
+    writeTaskLive(state, {
+      ...live,
+      status: 'ready',
+      lane: null,
+      lanePath: null,
+      agent: null,
+      updated_at: new Date().toISOString(),
+      history: [
+        ...live.history,
+        {
+          at: new Date().toISOString(),
+          from: live.status,
+          to: 'ready',
+          agent: 'doctor',
+          note: 'lease 过期或无对应占位，回收为 ready',
+        },
+      ],
+    });
+    fixed.push(`已回收过期 lease ${live.id}（${catalog.trunk}）`);
+  }
+}
+
+/** 只读检查（--fix 时先修再查）。返回 problems 非空即 doctor 退出 1。 */
+export async function doctorTasks(info: RepoInfo, fix: boolean): Promise<TaskDoctorReport> {
+  // catalog 只读、要跑 git，按「锁内不跑 git」放在锁外读一次。
   const catalog = readTrunkCatalog(info);
   const state = stateRoot(info);
+  const fixed: string[] = [];
+  if (fix) {
+    // 回滚 intent、隔离坏 live、回收过期 lease 都是写 live，必须独占全局锁。
+    await withLock(state, () => fixPass(info, state, catalog, fixed), { createStateDir: false });
+  }
+
   const states = listTaskLiveStates(state);
   const problems: string[] = [
     ...specProblems(catalog),

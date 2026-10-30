@@ -26,6 +26,21 @@ import { doctorTasks } from './taskdoctor.ts';
 import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 
+/** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
+const KNOWN_COMMANDS = new Set([
+  'init',
+  'claim',
+  'release',
+  'status',
+  'snapshot',
+  'ui',
+  'task',
+  'next',
+  'lane',
+  'brief',
+  'doctor',
+]);
+
 const USAGE = `cowork — 多 agent 同仓协作纪律层
 
 用法:
@@ -622,6 +637,14 @@ async function runLane(info: RepoInfo, args: Args, rest: readonly string[]): Pro
 async function main(argv: readonly string[]): Promise<number> {
   const args = parseArgs(argv);
   const { command, rest, flags } = args;
+  if (command === '--help' || command === '-h') {
+    console.log(USAGE);
+    return EXIT.OK;
+  }
+  if (command === '--version' || command === '-v') {
+    console.log('cowork 0.0.0 (M1)');
+    return EXIT.OK;
+  }
   if (command === '' || flags.has('help') || command === 'help') {
     console.log(USAGE);
     return command === '' ? EXIT.GENERAL : EXIT.OK;
@@ -629,6 +652,9 @@ async function main(argv: readonly string[]): Promise<number> {
   if (command === 'version') {
     console.log('cowork 0.0.0 (M1)');
     return EXIT.OK;
+  }
+  if (!KNOWN_COMMANDS.has(command)) {
+    throw general(`未知命令: ${command}`, '运行 cowork --help 查看可用命令。');
   }
 
   const info = needRepo();

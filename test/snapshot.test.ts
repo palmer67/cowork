@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { claim } from '../src/claims.ts';
+import { CoworkError, EXIT } from '../src/errors.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
 import { parseStatusCount, snapshot, type SnapshotLane } from '../src/snapshot.ts';
-import { stateRoot } from '../src/store.ts';
+import { ensureState, stateRoot } from '../src/store.ts';
+import { transitionTask } from '../src/taskstore.ts';
 import { removeTree } from './helpers.ts';
 
 const root = mkdtempSync(path.join(tmpdir(), 'cowork-snapshot-'));
@@ -105,6 +107,7 @@ test('枚举 .cowork/lanes 下的 worktree，排序并给出分支、HEAD 与采
   );
   assert.equal(snap.repo.head?.length, 7);
   assert.deepEqual(snap.tasks, []);
+  assert.deepEqual(snap.task_diagnostics, []);
   assert.deepEqual(snap.contract_alerts, []);
   for (const lane of snap.lanes) {
     assert.ok(lane.observed_at !== null);
@@ -256,4 +259,81 @@ test('交接目录不可读时车道带 error 和诊断，其他字段照常采�
     rmSync(notesFile, { force: true });
     rmSync(path.join(detachDir, '.cowork'), { recursive: true, force: true });
   }
+});
+
+test('tasks 带 live 状态与 spec_commit，坏 spec 进诊断，contract_alerts 报 reads↔touches', async () => {
+  const tasksDir = path.join(root, '.cowork', 'tasks');
+  mkdirSync(tasksDir, { recursive: true });
+  const writeSpec = (id: string, meta: Record<string, unknown>): void => {
+    writeFileSync(path.join(tasksDir, `${id}.md`), `---
+${JSON.stringify(meta, null, 2)}
+---
+
+## 背景
+`, 'utf8');
+  };
+  writeSpec('t-aaaaaa', {
+    schemaVersion: 1,
+    id: 't-aaaaaa',
+    title: 'reader',
+    touches: ['src/a/**'],
+    reads: ['src/shared/**'],
+    depends_on: [],
+    done_when: ['npm test'],
+    contracts: [],
+    created_at: '2026-10-30T09:00:00.000Z',
+  });
+  writeSpec('t-bbbbbb', {
+    schemaVersion: 1,
+    id: 't-bbbbbb',
+    title: 'writer',
+    touches: ['src/shared/x.ts'],
+    reads: [],
+    depends_on: [],
+    done_when: [],
+    contracts: [],
+    created_at: '2026-10-30T10:00:00.000Z',
+  });
+  writeFileSync(path.join(tasksDir, 't-cccccc.md'), `---
+not json
+---
+`, 'utf8');
+  git(['add', '-A'], root);
+  git(['commit', '-qm', 'add task specs'], root);
+
+  ensureState(stateRoot(info));
+  transitionTask(stateRoot(info), 't-aaaaaa', 'ready');
+  transitionTask(stateRoot(info), 't-bbbbbb', 'ready');
+
+  const snap = await snapshot(info);
+  const reader = snap.tasks.find((task) => task.id === 't-aaaaaa');
+  const writer = snap.tasks.find((task) => task.id === 't-bbbbbb');
+  assert.ok(reader !== undefined);
+  assert.ok(writer !== undefined);
+  assert.equal(reader.status, 'ready');
+  assert.equal(reader.spec_commit?.length, 40);
+  assert.deepEqual(reader.reads, ['src/shared/**']);
+  assert.equal(writer.depends_on.length, 0);
+
+  assert.ok(
+    snap.task_diagnostics.some((line) => line.includes('t-cccccc') && line.includes('任务规格无效')),
+    snap.task_diagnostics.join(' | '),
+  );
+  const alert = snap.contract_alerts.find((item) => item.kind === 'reads_touches');
+  assert.ok(alert !== undefined, 'reads 与别的任务 touches 重叠应产生提醒');
+  assert.equal(alert.task, 't-aaaaaa');
+  assert.equal(alert.peer_task, 't-bbbbbb');
+  assert.equal(alert.path, 'src/shared', '提醒里的路径用 parseClaim 的 display');
+});
+
+test('claims 目录读不出来时快照 fail closed，不把占位当空集', async () => {
+  const state = stateRoot(info);
+  ensureState(state);
+  rmSync(path.join(state, 'claims'), { recursive: true, force: true });
+  writeFileSync(path.join(state, 'claims'), 'not a directory', 'utf8');
+  await assert.rejects(
+    () => snapshot(info),
+    (err: unknown) =>
+      err instanceof CoworkError && err.code === EXIT.GENERAL && /任务状态不可读/.test(err.message),
+  );
 });

@@ -5,5 +5,5 @@ import { rmSync } from 'node:fs';
  * rmSync 会抛 ENOTEMPTY/EBUSY；重试几次让测试的退出码可信。
  */
 export function removeTree(dir: string): void {
-  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  rmSync(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
 }

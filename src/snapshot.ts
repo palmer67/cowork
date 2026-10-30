@@ -3,7 +3,11 @@ import path from 'node:path';
 import { expiresAt, isExpired } from './claims.ts';
 import { git, headCommit, type RepoInfo } from './git.ts';
 import { withLock } from './mutex.ts';
-import { listClaims, stateRoot } from './store.ts';
+import { conflicts, parseClaim, type ClaimPath } from './paths.ts';
+import { listClaims, stateRoot, type ClaimRecord } from './store.ts';
+import { collectTaskViews, type TaskView } from './taskops.ts';
+import { listTaskLiveStates, type TaskLiveStates } from './taskstore.ts';
+import { readTrunkCatalog } from './tasks.ts';
 
 /**
  * 最近一次交接单。契约字段是 id 与 created_at；title/path 是给面板的附加信息，
@@ -51,13 +55,37 @@ export interface SnapshotClaim {
   expired: boolean;
 }
 
+export interface SnapshotTask {
+  id: string;
+  title: string;
+  status: string;
+  touches: string[];
+  reads: string[];
+  depends_on: string[];
+  done_when: string[];
+  assigned_lane: string | null;
+  agent: string | null;
+  spec_commit: string | null;
+  updated_at: string | null;
+  blocked_reason: string | null;
+}
+
+/** reads ↔ 其他活跃任务 touches 的重叠提醒（M1 只报这一种契约冲突）。 */
+export interface ContractAlert {
+  kind: 'reads_touches';
+  task: string;
+  path: string;
+  peer_task: string;
+}
+
 export interface Snapshot {
   schemaVersion: 1;
   generatedAt: string;
   repo: { root: string; head: string | null };
-  tasks: unknown[];
+  tasks: SnapshotTask[];
+  task_diagnostics: string[];
   claims: SnapshotClaim[];
-  contract_alerts: unknown[];
+  contract_alerts: ContractAlert[];
   lanes: SnapshotLane[];
 }
 
@@ -313,18 +341,8 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
   return entry;
 }
 
-/**
- * live 状态只在 mutex 内读，Git 只读命令都在锁外跑：临界区不能持锁跑 git。
- * 状态目录还不存在时用只读锁模式直接读空表，不为了看一眼把它建出来。
- */
-async function readClaims(info: RepoInfo): Promise<SnapshotClaim[]> {
-  const state = stateRoot(info);
-  // 一律先取锁再读；createStateDir=false 时目录不存在不会创建（见 mutex.ts）。
-  const records = await withLock(
-    state,
-    () => (existsSync(state) ? listClaims(state) : []),
-    { createStateDir: false },
-  );
+/** live 记录在 mutex 内一次读齐，映射/派生都在锁外做。 */
+function mapClaims(records: readonly ClaimRecord[]): SnapshotClaim[] {
   const now = Date.now();
   return records.map((rec) => ({
     path: rec.display,
@@ -348,9 +366,70 @@ function samePath(a: string, b: string): boolean {
   return process.platform === 'win32' ? left.toLowerCase() === right.toLowerCase() : left === right;
 }
 
+function toSnapshotTask(view: TaskView): SnapshotTask {
+  return {
+    id: view.id,
+    title: view.title,
+    status: view.status,
+    touches: view.touches,
+    reads: view.reads,
+    depends_on: view.depends_on,
+    done_when: view.done_when,
+    assigned_lane: view.assigned_lane,
+    agent: view.agent,
+    spec_commit: view.spec_commit,
+    updated_at: view.updated_at,
+    blocked_reason: view.blocked_reason,
+  };
+}
+
+const ACTIVE_STATUSES = new Set(['ready', 'claimed', 'in_progress', 'reported_done', 'blocked']);
+
+/** 只提示"我在读、别人在写"的重叠；spec 路径已经过 paths.ts 规范化，这里再包一层容错。 */
+function contractAlerts(info: RepoInfo, views: readonly TaskView[]): ContractAlert[] {
+  const alerts: ContractAlert[] = [];
+  const active = views.filter((view) => ACTIVE_STATUSES.has(view.status));
+  const claimOf = (raw: string): ClaimPath | null => {
+    try {
+      return parseClaim(raw, info);
+    } catch {
+      return null;
+    }
+  };
+  for (const reader of active) {
+    const reads = reader.reads.map(claimOf).filter((item): item is ClaimPath => item !== null);
+    if (reads.length === 0) continue;
+    for (const writer of active) {
+      if (writer.id === reader.id) continue;
+      const touches = writer.touches.map(claimOf).filter((item): item is ClaimPath => item !== null);
+      for (const read of reads) {
+        const hit = touches.find((touch) => conflicts(read, touch));
+        if (hit !== undefined) {
+          alerts.push({ kind: 'reads_touches', task: reader.id, path: read.display, peer_task: writer.id });
+        }
+      }
+    }
+  }
+  return alerts;
+}
+
 /** 面板唯一数据源；只读，不写 claims，也不创建状态目录。 */
 export async function snapshot(info: RepoInfo): Promise<Snapshot> {
-  const claims = await readClaims(info);
+  // catalog 要跑 git，必须在锁外读；live（claims/task live）在锁内一次取齐。
+  const catalog = readTrunkCatalog(info);
+  const state = stateRoot(info);
+  const live = await withLock(
+    state,
+    () => ({
+      claims: listClaims(state),
+      tasks: listTaskLiveStates(state) as TaskLiveStates,
+    }),
+    { createStateDir: false },
+  );
+  const claims = mapClaims(live.claims);
+  const view = collectTaskViews(info, catalog, live.tasks);
+  const tasks = view.views.map(toSnapshotTask);
+  const taskDiagnostics = view.diagnostics.map((item) => `${item.file}: ${item.error}`);
 
   const lanesRoot = path.join(info.mainRoot, '.cowork', 'lanes');
   const lanes: SnapshotLane[] = [];
@@ -375,9 +454,10 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     repo: { root: info.mainRoot, head: headCommit(info.mainRoot) },
-    tasks: [],
+    tasks,
+    task_diagnostics: taskDiagnostics,
     claims,
-    contract_alerts: [],
+    contract_alerts: contractAlerts(info, view.views),
     lanes,
   };
 }

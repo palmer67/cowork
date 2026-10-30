@@ -106,12 +106,14 @@
 4. 分支：
    - `C'` 非空 → 取第一个（FIFO：`created_at` 升序，同秒按 `id` 升序）。
    - `C'` 空且 `C` 非空 → **exit 2**，打印赢家：哪个 task、哪条 lane、哪个 agent、何时领的。
+   - `C'` 空且 `C` 非空、但 `C` 只是因 touches 被手工 claim / held lease 占用（没有任务赢家）
+     → **exit 1**，逐条打印占用者（与 §12.3 同语义；没有赢家就不许伪装成"被别人领走"）。
    - `C'` 空且 `C` 也空 → **exit 1**，打印阻塞原因：等哪个依赖未 `merged`、哪条路径被谁占。
      不允许只输出"没有任务"。
 5. 事务：写 `next` intent（operation id、task id、lane、旧状态、拟写 claim ids）→ 写 task lease
    → 写全部 touches claims → 标记 intent `committed` → 清除 intent。
 6. **全占或全不占**：任一步失败，在锁内按 intent 幂等回滚已写记录，任务状态不变；回滚失败
-   标记 `corrupt` 并 **fail closed**（exit 3 或 1，绝不把任务开放给第二个 owner）。
+   标记 `corrupt` 并 **fail closed**（exit 1，绝不把任务开放给第二个 owner）。
 7. 恢复：任何命令取得锁后先扫 intents。无 `committed` → 按 intent 回滚；有 `committed` →
    核对 task lease 与全部 claims 齐全，缺一个就 `corrupt` + fail closed。
 8. **锁内不跑 git**（协议 §7）：catalog 已在锁外读进内存；锁内只做 live 文件的读写。
@@ -172,7 +174,8 @@ task lease 的 `spec_commit` 与 trunk 漂移、live task JSON 损坏、残留 i
 | `next` 调用时无候选（打印依赖/占用原因） | 1 |
 | `next` 候选在等待锁期间被别人领走 | 2 |
 | `lane new` 重名或路径/分支已存在 | 2 |
-| 不在 git 仓库、无 git、路径越界、live 状态损坏需人工 | 3 |
+| 不在 git 仓库、无 git、路径越界 | 3 |
+| live 状态损坏（消息必须含 `任务状态文件损坏: <文件>`） | 1 |
 
 错误信息：**有 owner 就说明 owner，没有 owner 就说明阻塞原因和解决命令**（参数错误、依赖环、
 空候选都不存在 owner，不要硬套"谁占着"）。

@@ -41,6 +41,27 @@ export function claimsDir(state: string): string {
   return path.join(state, 'claims');
 }
 
+function message(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 读一个 live 状态目录。目录不存在 = 合法空集（还没人占位）；
+ * 存在但读不出来（ACL、坏 junction、路径被文件占着）必须 fail closed——
+ * 把读不出的占位当成"没有占位"会让 next 放行一个已经被占用的路径。
+ */
+export function readStateDir(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw general(
+      `任务状态不可读: ${dir}（${message(err)}）`,
+      '读不出占位/任务状态时不能把空集当成"没有占位或没有任务"；检查 .git/cowork 的权限或 junction 指向，修好后重试。',
+    );
+  }
+}
+
 export function ensureState(state: string): void {
   mkdirSync(claimsDir(state), { recursive: true });
   mkdirSync(path.join(state, 'trash'), { recursive: true });
@@ -149,8 +170,7 @@ export function removeClaim(state: string, id: string): boolean {
 /** claims 目录里登记的所有 id（不解析内容），doctor 用它逐条隔离坏文件。 */
 export function listClaimIds(state: string): string[] {
   const dir = claimsDir(state);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
+  return readStateDir(dir)
     .filter((name) => name.endsWith('.json'))
     .map((name) => name.slice(0, -'.json'.length))
     .sort();
@@ -172,10 +192,8 @@ export function quarantineClaim(state: string, id: string): string | null {
 }
 
 export function listClaims(state: string): ClaimRecord[] {
-  const dir = claimsDir(state);
-  if (!existsSync(dir)) return [];
   const out: ClaimRecord[] = [];
-  for (const name of readdirSync(dir)) {
+  for (const name of readStateDir(claimsDir(state))) {
     if (!name.endsWith('.json')) continue;
     // 坏文件不跳过：读不出来就抛错，让人先 doctor --fix，别把占位当不存在。
     const rec = readClaim(state, name.slice(0, -'.json'.length));

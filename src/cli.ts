@@ -6,6 +6,24 @@ import { CoworkError, EXIT, general } from './errors.ts';
 import { currentBranch, headCommit, repoInfo, type RepoInfo } from './git.ts';
 import { snapshot, type Snapshot } from './snapshot.ts';
 import { stateRoot, type ClaimRecord } from './store.ts';
+import {
+  addTask,
+  blockTask,
+  brief,
+  cancelTask,
+  confirmMerge,
+  defaultAgent,
+  laneNew,
+  listTasks,
+  readyTask,
+  reportDone,
+  showTask,
+  startTask,
+  type TaskView,
+} from './taskops.ts';
+import { next } from './tasknext.ts';
+import { doctorTasks } from './taskdoctor.ts';
+import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 
 const USAGE = `cowork — 多 agent 同仓协作纪律层
@@ -15,7 +33,22 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork claim <路径>...          占位（精确文件或目录前缀，目录可写 dir/**）
   cowork release [<路径>...]      释放占位（省略路径则释放本工作树全部）
   cowork status [--json]          查看当前全部占位
-  cowork snapshot [--json]        只读快照：车道、未提交改动与占位
+  cowork snapshot [--json]        只读快照：车道、未提交改动、占位与任务
+  cowork task add --title <文本> [--touches <路径>]... [--reads <路径>]...
+               [--depends <id>]... [--done-when <命令>]...
+                                  创建 draft 任务规格（不接受 --status）
+  cowork task ls [--status <状态>] [--json]
+  cowork task show <id> [--json]
+  cowork task ready <id>          draft → ready（要求 spec 已在 trunk 可达）
+  cowork next [--agent <名>] [--json]
+                                  领取一个 ready 任务（FIFO；崩溃事务可恢复）
+  cowork task start|report-done <id>
+  cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>
+  cowork task block <id> --reason <文本>
+  cowork task cancel <id> [--reason <文本>]
+  cowork brief [--agent <名>]    开工摘要（只读）
+  cowork lane new <名> [--base <ref>]
+                                  创建车道（git worktree，不持锁）
   cowork ui [--out <路径>] [--open]
   cowork ui --watch [--interval <秒>]
                                   生成只读看板（静态 HTML，不监听端口）；
@@ -29,17 +62,36 @@ interface Args {
   command: string;
   rest: string[];
   flags: Set<string>;
-  values: Map<string, string>;
+  /** 值型 flag 可以有多个（--touches 可重复）；取最后一个用 value()，取全部用 values()。 */
+  values: Map<string, string[]>;
 }
 
-/** 只需要 `--flag`、`--key=value` 和值型 flag（`--note <文本>`、`--out <路径>`、`--interval <秒>`）。 */
-const VALUE_FLAGS = new Set(['note', 'out', 'interval']);
+const VALUE_FLAGS = new Set([
+  'note',
+  'out',
+  'interval',
+  'title',
+  'touches',
+  'reads',
+  'depends',
+  'done-when',
+  'status',
+  'agent',
+  'reason',
+  'commit',
+  'base',
+]);
 
 function parseArgs(argv: readonly string[]): Args {
   const [command = '', ...tail] = argv;
   const rest: string[] = [];
   const flags = new Set<string>();
-  const values = new Map<string, string>();
+  const values = new Map<string, string[]>();
+  const push = (name: string, value: string): void => {
+    const list = values.get(name);
+    if (list === undefined) values.set(name, [value]);
+    else list.push(value);
+  };
   for (let i = 0; i < tail.length; i += 1) {
     const item = tail[i] as string;
     if (!item.startsWith('--')) {
@@ -49,18 +101,28 @@ function parseArgs(argv: readonly string[]): Args {
     const body = item.slice(2);
     const eq = body.indexOf('=');
     if (eq >= 0) {
-      values.set(body.slice(0, eq), body.slice(eq + 1));
+      push(body.slice(0, eq), body.slice(eq + 1));
       continue;
     }
     const next = tail[i + 1];
     if (VALUE_FLAGS.has(body) && next !== undefined && !next.startsWith('--')) {
-      values.set(body, next);
+      push(body, next);
       i += 1;
       continue;
     }
     flags.add(body);
   }
   return { command, rest, flags, values };
+}
+
+function value(args: Args, name: string): string | null {
+  const list = args.values.get(name);
+  if (list === undefined || list.length === 0) return null;
+  return list[list.length - 1] as string;
+}
+
+function values(args: Args, name: string): string[] {
+  return args.values.get(name) ?? [];
 }
 
 function needRepo(): RepoInfo {
@@ -103,7 +165,7 @@ async function runClaim(
   inputs: readonly string[],
   args: Args,
 ): Promise<number> {
-  const note = args.values.get('note');
+  const note = value(args, 'note') ?? undefined;
   const result = await claim(info, inputs, { note });
   for (const rec of result.claimed) console.log(`已占位 ${rec.display}`);
   for (const rec of result.refreshed) console.log(`已续期 ${rec.display}`);
@@ -274,9 +336,9 @@ async function openQuietly(file: string): Promise<void> {
 }
 
 async function runUi(info: RepoInfo, args: Args): Promise<number> {
-  const out = args.values.get('out');
+  const out = value(args, 'out') ?? undefined;
   const watching = args.flags.has('watch');
-  if (!watching && args.values.has('interval')) {
+  if (!watching && value(args, 'interval') !== null) {
     throw general('--interval 只能和 --watch 一起用', '用法: cowork ui --watch [--interval <秒>]');
   }
 
@@ -290,7 +352,7 @@ async function runUi(info: RepoInfo, args: Args): Promise<number> {
     return EXIT.OK;
   }
 
-  const seconds = parseInterval(args.values.get('interval'));
+  const seconds = parseInterval(value(args, 'interval') ?? undefined);
   const controller = new AbortController();
   let stopping = false;
   const fatal: Error[] = [];
@@ -344,31 +406,216 @@ async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {
   console.log(`主仓库: ${info.mainRoot}`);
   console.log(`共享 git 目录: ${info.commonDir}`);
   console.log(`live 状态: ${stateRoot(info)}`);
-  if (!existsSync(stateRoot(info))) {
-    console.log('状态目录尚未创建（还没运行过任何占位命令）。');
-    return EXIT.OK;
-  }
-  if (!fix) {
+  let bad = false;
+  const state = stateRoot(info);
+  if (!existsSync(state)) {
+    console.log('状态目录尚未创建（还没运行过任何占位或任务命令）。');
+  } else if (!fix) {
     const report = await status(info);
     if (report.expired.length === 0) {
       console.log('未发现过期占位。');
+    } else {
+      bad = true;
+      console.log(`发现 ${report.expired.length} 个已过期占位:`);
+      for (const rec of report.expired) console.log(`  ${rec.display}  ${rec.createdAt}  ${describeAgent(rec)}`);
+      console.log('运行 cowork doctor --fix 清理。');
+    }
+  } else {
+    const report = await doctorFix(info);
+    for (const rec of report.pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
+    for (const item of report.quarantined) {
+      const where = item.trash === null ? '隔离失败，原文件仍在' : `已隔离到 ${item.trash}`;
+      console.log(`已隔离损坏状态文件 ${item.path}：${where}`);
+      console.log(`  → ${item.reason}`);
+    }
+    if (report.pruned.length === 0 && report.quarantined.length === 0) {
+      console.log('未发现过期占位或损坏状态。');
+    }
+  }
+
+  const tasks = await doctorTasks(info, fix);
+  for (const line of tasks.fixed) console.log(line);
+  if (tasks.problems.length === 0) {
+    console.log('任务层未发现问题。');
+  } else {
+    bad = true;
+    console.log(`任务层发现 ${tasks.problems.length} 个问题:`);
+    for (const line of tasks.problems) console.log(`  ${line}`);
+    console.log('能自动修的先运行 cowork doctor --fix；spec 问题需要改文件后重新提交。');
+  }
+  return bad ? EXIT.GENERAL : EXIT.OK;
+}
+
+function printTaskRow(view: TaskView): void {
+  const lane = view.assigned_lane ?? '(未领取)';
+  const agent = view.agent === null ? '' : ` agent=${view.agent}`;
+  console.log(`${view.id}  ${view.status.padEnd(13)}  ${lane.padEnd(14)} ${view.title}${agent}`);
+}
+
+function printTaskDetail(view: TaskView, history: readonly string[]): void {
+  console.log(`${view.id}  ${view.title}`);
+  console.log(`  状态: ${view.status}`);
+  if (view.blocked_reason !== null) console.log(`  阻塞原因: ${view.blocked_reason}`);
+  console.log(`  touches: ${view.touches.join(', ') || '(空)'}`);
+  console.log(`  reads: ${view.reads.join(', ') || '(空)'}`);
+  console.log(`  depends_on: ${view.depends_on.join(', ') || '(空)'}`);
+  console.log(`  done_when: ${view.done_when.join('; ') || '(空)'}`);
+  console.log(`  车道: ${view.assigned_lane ?? '(未领取)'}  agent: ${view.agent ?? '(无)'}`);
+  console.log(`  spec_commit: ${view.spec_commit ?? '(无)'}`);
+  console.log(`  更新时间: ${stamp(view.updated_at)}`);
+  if (view.spec_path !== null) console.log(`  spec: ${view.spec_path}`);
+  if (history.length > 0) {
+    console.log('  最近历史:');
+    for (const line of history) console.log(`    ${line}`);
+  }
+}
+
+async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Promise<number> {
+  const sub = rest[0] ?? '';
+  const id = rest[1] ?? '';
+  const needId = (): string => {
+    if (id === '') throw general('需要任务 id', '例如: cowork task show t-3f9a1c');
+    return id;
+  };
+  const agent = defaultAgent(value(args, 'agent'));
+
+  switch (sub) {
+    case 'add': {
+      const title = value(args, 'title');
+      if (title === null || title.trim() === '') {
+        throw general('task add 需要 --title <文本>', '例如: cowork task add --title "给登录页加验证码" --touches src/auth/**');
+      }
+      const touches = values(args, 'touches');
+      if (touches.length === 0) {
+        throw general('touches 不能为空', '至少一个 --touches <路径>；touches 决定领取时的文件占位。');
+      }
+      const spec = await addTask(info, {
+        title,
+        touches,
+        reads: values(args, 'reads'),
+        depends_on: values(args, 'depends'),
+        done_when: values(args, 'done-when'),
+      });
+      console.log(`已创建 ${spec.id}（draft）`);
+      console.log(`  ${spec.path}`);
+      console.log(`下一步: 把 spec 提交到 trunk 后运行 cowork task ready ${spec.id}。`);
       return EXIT.OK;
     }
-    console.log(`发现 ${report.expired.length} 个已过期占位:`);
-    for (const rec of report.expired) console.log(`  ${rec.display}  ${rec.createdAt}  ${describeAgent(rec)}`);
-    console.log('运行 cowork doctor --fix 清理。');
+    case 'ls': {
+      const filter = value(args, 'status');
+      const list = await listTasks(info, filter);
+      if (args.flags.has('json')) {
+        console.log(JSON.stringify(list, null, 2));
+        return EXIT.OK;
+      }
+      if (list.views.length === 0) console.log('没有任务。用 cowork task add 创建 spec。');
+      for (const view of list.views) printTaskRow(view);
+      for (const diag of list.diagnostics) console.log(`! ${diag.file}: ${diag.error}`);
+      return EXIT.OK;
+    }
+    case 'show': {
+      const result = await showTask(info, needId());
+      if (args.flags.has('json')) {
+        console.log(JSON.stringify(result, null, 2));
+        return EXIT.OK;
+      }
+      const history = (result.live?.history ?? [])
+        .slice(-5)
+        .map((entry) => `${stamp(entry.at)}  ${entry.from ?? '—'} → ${entry.to}${entry.agent === null ? '' : `  agent=${entry.agent}`}${entry.note === null ? '' : `  ${entry.note}`}`);
+      printTaskDetail(result.view, history);
+      return EXIT.OK;
+    }
+    case 'ready': {
+      const live = await readyTask(info, needId());
+      console.log(`${live.id} → ready（spec_commit ${live.spec_commit ?? '?'}）`);
+      console.log(`下一步: cowork next 领取，或先 cowork task ls 查看队列。`);
+      return EXIT.OK;
+    }
+    case 'start': {
+      const live = await startTask(info, needId(), agent);
+      console.log(`${live.id} → in_progress（agent=${agent}）`);
+      return EXIT.OK;
+    }
+    case 'report-done': {
+      const live = await reportDone(info, needId(), agent);
+      console.log(`${live.id} → reported_done（agent=${agent}）`);
+      console.log(`合并后运行 cowork task confirm-merge ${live.id} --commit <sha> --manual --reason "..."。`);
+      return EXIT.OK;
+    }
+    case 'confirm-merge': {
+      const commit = value(args, 'commit') ?? '';
+      const reason = value(args, 'reason');
+      const result = await confirmMerge(info, needId(), {
+        commit,
+        manual: args.flags.has('manual'),
+        reason,
+      });
+      console.log(`${result.live.id} → merged（${commit.slice(0, 7)}）`);
+      for (const display of result.released) console.log(`  已释放占位 ${display}`);
+      return EXIT.OK;
+    }
+    case 'block': {
+      const reason = value(args, 'reason') ?? '';
+      const live = await blockTask(info, needId(), agent, reason);
+      console.log(`${live.id} → blocked（${reason}）`);
+      return EXIT.OK;
+    }
+    case 'cancel': {
+      const reason = value(args, 'reason');
+      const result = await cancelTask(info, needId(), agent, reason);
+      console.log(`${result.live.id} → cancelled`);
+      for (const display of result.released) console.log(`  已释放占位 ${display}`);
+      return EXIT.OK;
+    }
+    default:
+      throw general(
+        `未知 task 子命令: ${sub === '' ? '(空)' : sub}`,
+        '可用: add / ls / show / ready / start / report-done / confirm-merge / block / cancel。',
+      );
+  }
+}
+
+async function runNext(info: RepoInfo, args: Args): Promise<number> {
+  const agent = defaultAgent(value(args, 'agent'));
+  const result = await next(info, { agent });
+  if (args.flags.has('json')) {
+    console.log(JSON.stringify(result, null, 2));
     return EXIT.OK;
   }
-  const report = await doctorFix(info);
-  for (const rec of report.pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
-  for (const item of report.quarantined) {
-    const where = item.trash === null ? '隔离失败，原文件仍在' : `已隔离到 ${item.trash}`;
-    console.log(`已隔离损坏状态文件 ${item.path}：${where}`);
-    console.log(`  → ${item.reason}`);
+  if (result.recovery.recovered.length > 0) {
+    console.log(`已回滚未完成事务: ${result.recovery.recovered.join(', ')}`);
   }
-  if (report.pruned.length === 0 && report.quarantined.length === 0) {
-    console.log('未发现过期占位或损坏状态。');
+  console.log(`已领取 ${result.task.id}  ${result.task.title}`);
+  console.log(`  touches: ${result.task.touches.join(', ') || '(空)'}`);
+  console.log(`  depends_on: ${result.task.depends_on.join(', ') || '(空)'}`);
+  console.log(`  done_when: ${result.task.done_when.join('; ') || '(空)'}`);
+  console.log(`  lane: ${result.live.lane ?? '(main)'}  agent: ${agent}`);
+  console.log(`  spec_commit: ${result.specCommit}`);
+  console.log('下一步: cowork task start ' + result.task.id);
+  return EXIT.OK;
+}
+
+async function runBrief(info: RepoInfo, args: Args): Promise<number> {
+  const catalog = readTrunkCatalog(info);
+  const text = await brief(info, { agent: defaultAgent(value(args, 'agent')), catalog });
+  console.log(text);
+  return EXIT.OK;
+}
+
+async function runLane(info: RepoInfo, args: Args, rest: readonly string[]): Promise<number> {
+  if (rest[0] !== 'new') {
+    throw general(`未知 lane 子命令: ${rest[0] ?? '(空)'}`, '用法: cowork lane new <名> [--base <ref>]');
   }
+  if (args.flags.has('task')) {
+    throw general('lane new 不接受 --task', '任务用 cowork task add/ready 管理；lane 只建工作树。');
+  }
+  const name = rest[1] ?? '';
+  if (name === '') throw general('lane new 需要车道名', '例如: cowork lane new auth');
+  const result = laneNew(info, name, value(args, 'base'));
+  console.log(`已创建车道 ${result.name}: ${result.path}`);
+  console.log(`  branch: ${result.branch}（base ${result.base}）`);
+  console.log(`  cd ${result.path}`);
+  console.log(`  建议: COWORK_AGENT_ID=${result.name}`);
   return EXIT.OK;
 }
 
@@ -380,7 +627,7 @@ async function main(argv: readonly string[]): Promise<number> {
     return command === '' ? EXIT.GENERAL : EXIT.OK;
   }
   if (command === 'version') {
-    console.log('cowork 0.0.0 (M0)');
+    console.log('cowork 0.0.0 (M1)');
     return EXIT.OK;
   }
 
@@ -399,6 +646,14 @@ async function main(argv: readonly string[]): Promise<number> {
       return runSnapshot(info, flags.has('json'));
     case 'ui':
       return runUi(info, args);
+    case 'task':
+      return runTask(info, args, rest);
+    case 'next':
+      return runNext(info, args);
+    case 'lane':
+      return runLane(info, args, rest);
+    case 'brief':
+      return runBrief(info, args);
     case 'doctor':
       return runDoctor(info, flags.has('fix'));
     default:

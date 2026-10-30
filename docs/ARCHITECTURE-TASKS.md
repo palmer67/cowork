@@ -179,6 +179,10 @@ assessParallel(
 
 文件统计用 `git status --porcelain=v1 -z --untracked-files=all` 结构化解析，重命名算一个变更文件；Git 忽略项不计入。最近 handoff 从该 lane 可达的 `.cowork/notes/` 加上本地未提交 handoff 中筛选 `lane` 匹配者，按元数据时间倒序、id 作为同时间排序键，故新交接不必等待合并到 trunk 才可展示。lane detached HEAD 时 `branch=null`，缺失 worktree/读取失败时增加 `error`，将不可得的字段设为 `null`，不能伪装为 `dirty=false`、文件数 0。
 
+主工作树本身不在 `.cowork/lanes/` 下，但同样有人（如 Codex）在里面直接改文件，所以也作为一条记录输出：`lane` 为 `null`、面板显示为 `(main)`，排在其它 lane 之前，`dirty`/`changed_file_count`/`last_handoff` 语义相同（主工作树的最近 handoff 只按分支名匹配）。这样 `git worktree list` 里的每条工作树都在快照里有对应行，不会出现"改动看不见"的盲区。
+
+`cowork ui` 的 `--watch` 形态只是反复调用同一份 snapshot 再原子重写 HTML（`<meta http-equiv="refresh">` 由浏览器负责重载），不改变本节契约：每次采样仍走同一把基础 mutex，面板仍然只读。
+
 ## 9. 错误码与不变约束
 
 沿用既有退出码：`0` 操作成功/并行允许；`1` 一般错误、task spec/验证失败；`2` 被占用、touches/依赖阻止并行、重复领取或 Git 冲突；`3` 环境不满足。错误继续说明 lane/任务占用者与下一步命令。

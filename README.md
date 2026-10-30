@@ -39,12 +39,16 @@ cd .cowork/lanes/fix-login
 cowork claim src/auth/**
 ```
 
-只读面板：静态 HTML，不监听端口，重跑即可刷新。
+只读面板：静态 HTML，不监听端口。`--watch` 前台重写同一个文件，页面靠 meta refresh
+自己重载（默认 2 秒，`--interval` 改整秒间隔），Ctrl+C 退出；不起服务、不起后台进程。
 
 ```bash
 cowork snapshot --json   # 面板的唯一数据源（车道、未提交改动、最近交接、占位）
 cowork ui --open         # 渲染到系统临时目录并打开浏览器；--out 可指定路径
+cowork ui --watch        # 开着就能看：每 2 秒重新采样并重写面板
 ```
+
+主工作树（Codex 等在主仓库里直接干活的那个）也会作为一条 `(main)` 行出现在面板里。
 
 规划中的命令（M1+）：`cowork lane new`、`cowork brief`、`cowork handoff`、`cowork merge --dry-run`。
 

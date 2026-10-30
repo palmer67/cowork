@@ -8,6 +8,7 @@ import { claim } from '../src/claims.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
 import { parseStatusCount, snapshot, type SnapshotLane } from '../src/snapshot.ts';
 import { stateRoot } from '../src/store.ts';
+import { removeTree } from './helpers.ts';
 
 const root = mkdtempSync(path.join(tmpdir(), 'cowork-snapshot-'));
 const lanesRoot = path.join(root, '.cowork', 'lanes');
@@ -70,7 +71,15 @@ before(() => {
 });
 
 after(() => {
-  rmSync(root, { recursive: true, force: true });
+  // 先让 git 自己注销 worktree，再删目录：Windows 上顺序反了会留下锁文件导致 ENOTEMPTY。
+  for (const dir of [alphaDir, betaDir, detachDir]) {
+    try {
+      git(['worktree', 'remove', '--force', dir], root);
+    } catch {
+      // 目录可能已被测试删除（gone），失败无所谓。
+    }
+  }
+  removeTree(root);
 });
 
 test('parseStatusCount：重命名一对只计 1，路径去重，忽略项不计', () => {
@@ -198,4 +207,53 @@ test('claims 在 mutex 内读取，并带过期计算结果', async () => {
   assert.equal(record.expired, false);
   assert.ok(Number.isFinite(Date.parse(record.expiresAt)));
   assert.ok(Date.parse(record.expiresAt) > Date.now());
+});
+
+test('车道名以 .. 开头不会被当成越界路径过滤', async () => {
+  const hidden = path.join(lanesRoot, '..hidden');
+  git(['worktree', 'add', '-q', '-b', 'dot-hidden', hidden], root);
+  try {
+    const snap = await snapshot(info);
+    const lane = laneOf(snap.lanes, '..hidden');
+    assert.equal(lane.branch, 'dot-hidden');
+    assert.equal(lane.dirty, false);
+    assert.equal(lane.error, undefined);
+  } finally {
+    git(['worktree', 'remove', '--force', hidden], root);
+  }
+});
+
+test('坏 front matter 给出文件级诊断，不把"读不到"显示成"没有交接"', async () => {
+  const notes = path.join(betaDir, '.cowork', 'notes');
+  const bad = path.join(notes, 'broken.md');
+  writeFileSync(bad, '---\n{ not json\n---\n\n# broken\n', 'utf8');
+  try {
+    const snap = await snapshot(info);
+    const beta = laneOf(snap.lanes, 'beta');
+    assert.ok(
+      beta.handoff_diagnostics?.some((line) => line.startsWith('broken.md:')),
+      beta.handoff_diagnostics?.join(' | '),
+    );
+    // 坏的只是诊断项，前面合法的交接单仍然是最近交接。
+    assert.equal(beta.last_handoff.id, '2026-10-30-beta-later');
+  } finally {
+    rmSync(bad, { force: true });
+  }
+});
+
+test('交接目录不可读时车道带 error 和诊断，其他字段照常采样', async () => {
+  const notesFile = path.join(detachDir, '.cowork', 'notes');
+  mkdirSync(path.join(detachDir, '.cowork'), { recursive: true });
+  writeFileSync(notesFile, 'not a directory', 'utf8');
+  try {
+    const snap = await snapshot(info);
+    const detach = laneOf(snap.lanes, 'detach');
+    assert.ok(detach.error?.includes('无法读取交接目录'), detach.error);
+    assert.equal(detach.handoff_diagnostics?.length, 1);
+    assert.equal(detach.last_handoff.id, null);
+    assert.equal(detach.head?.length, 7, 'Git 字段仍然可用');
+  } finally {
+    rmSync(notesFile, { force: true });
+    rmSync(path.join(detachDir, '.cowork'), { recursive: true, force: true });
+  }
 });

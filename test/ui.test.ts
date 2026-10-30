@@ -7,6 +7,7 @@ import { CoworkError, EXIT } from '../src/errors.ts';
 import type { RepoInfo } from '../src/git.ts';
 import type { Snapshot, SnapshotHandoff, SnapshotLane } from '../src/snapshot.ts';
 import { escapeHtml, panelPath, renderPanel, watchPanel, writePanel } from '../src/ui.ts';
+import { removeTree } from './helpers.ts';
 
 const NO_HANDOFF: SnapshotHandoff = {
   id: null,
@@ -38,6 +39,7 @@ const lanes: SnapshotLane[] = [
       title: '<b>交接</b>',
       path: 'notes/2026-10-30-alpha.md',
     },
+    handoff_diagnostics: ['坏文件.md: 缺少 --- 包裹的 JSON front matter', '<bad> 读不了'],
   },
   {
     lane: 'detach',
@@ -110,6 +112,7 @@ const EMPTY: Snapshot = {
 test('escapeHtml 转义所有会破坏 HTML 的字符', () => {
   assert.equal(escapeHtml(`<script>"x"&'y'`), '&lt;script&gt;&quot;x&quot;&amp;&#39;y&#39;');
   assert.equal(escapeHtml('普通文本'), '普通文本');
+  assert.equal(escapeHtml(42), '42', '数字也走同一个入口（pid 渲染）');
 });
 
 test('面板数据全部转义：占位备注、交接标题、错误信息都不能变成标记', () => {
@@ -121,6 +124,10 @@ test('面板数据全部转义：占位备注、交接标题、错误信息都�
   assert.ok(html.includes('&lt;b&gt;交接&lt;/b&gt;'), '交接标题必须转义');
   assert.ok(html.includes('车道目录不存在 &lt;bad&gt;'), '错误信息必须转义');
   assert.ok(html.includes('src/&lt;x&gt;.ts'), '占位路径必须转义');
+  assert.ok(html.includes('<ul class="diag">'), '交接单诊断必须出现在面板上');
+  assert.ok(html.includes('坏文件.md: 缺少 --- 包裹的 JSON front matter'));
+  assert.ok(html.includes('&lt;bad&gt; 读不了'), '诊断内容同样要转义');
+  assert.ok(html.includes('pid 42@host'), 'pid 按文本渲染');
 });
 
 test('面板呈现车道状态、未提交数量、detached 与过期占位', () => {
@@ -168,15 +175,19 @@ test('panelPath 按 commonDir 稳定，writePanel 落盘且内容与渲染一致
     assert.ok(existsSync(direct));
     rmSync(direct, { force: true });
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    removeTree(root);
   }
 });
 
 test('只有 --watch 渲染 meta refresh，静态面板不自我重载', () => {
-  assert.ok(!renderPanel(snap).includes('http-equiv="refresh"'), '静态面板不应自动重载');
+  const plain = renderPanel(snap);
+  assert.ok(!plain.includes('http-equiv="refresh"'), '静态面板不应自动重载');
+  assert.ok(plain.includes('数据截至'), '页头给出数据时间');
+  assert.ok(plain.includes('进程停止后不会继续更新。'), '静态面板要说明不会自己更新');
   const watched = renderPanel(snap, { refreshSeconds: 2 });
   assert.ok(watched.includes('<meta http-equiv="refresh" content="2">'));
   assert.ok(watched.includes('每 2 秒自动刷新'));
+  assert.ok(watched.includes('watch 每 2 秒重写'));
   assert.ok(watched.includes('Ctrl+C 停止 watch'));
 });
 
@@ -217,11 +228,54 @@ test('watchPanel 循环重写同一文件，退出后去掉 refresh，且不留�
       '原子写的临时文件必须清理干净',
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    removeTree(dir);
   }
 });
 
-test('写不出面板文件时按退出码 3（环境不满足）报错', () => {
+test('退出前最终采样失败只警告，不把 watch 结果变成失败', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'cowork-watch-final-'));
+  const warnings: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map(String).join(' '));
+  };
+  try {
+    const out = path.join(dir, 'panel.html');
+    const info: RepoInfo = {
+      mainRoot: 'D:\\\\repo',
+      laneTop: 'D:\\\\repo',
+      commonDir: 'D:\\\\repo\\\\.git',
+      laneName: null,
+    };
+    const controller = new AbortController();
+    let calls = 0;
+    const file = await watchPanel(info, {
+      out,
+      intervalMs: 20,
+      signal: controller.signal,
+      source: async () => {
+        calls += 1;
+        if (calls === 1) return snap;
+        throw new Error('收尾采样失败');
+      },
+      onWrite: (_file, _snap, index) => {
+        if (index === 1) controller.abort();
+      },
+    });
+    assert.equal(file, out, '返回最后一次成功写出的路径');
+    assert.ok(
+      warnings.some((line) => line.includes('退出前写入最终面板失败')),
+      `应警告收尾失败，实际: ${warnings.join(' | ')}`,
+    );
+    // 第一次写入带 refresh；收尾失败后文件保持原样，但进程没有因此报错。
+    assert.ok(readFileSync(out, 'utf8').includes('http-equiv="refresh"'));
+  } finally {
+    console.warn = original;
+    removeTree(dir);
+  }
+});
+
+test('写不出面板文件时按 IO 错误退出 1', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'cowork-ui-err-'));
   try {
     // 父路径是同名文件：mkdir 必然失败，模拟不可写目标。
@@ -235,9 +289,9 @@ test('写不出面板文件时按退出码 3（环境不满足）报错', () => 
     };
     assert.throws(
       () => writePanel(info, snap, { out: path.join(blocker, 'panel.html') }),
-      (err: unknown) => err instanceof CoworkError && err.code === EXIT.ENV,
+      (err: unknown) => err instanceof CoworkError && err.code === EXIT.GENERAL,
     );
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    removeTree(dir);
   }
 });

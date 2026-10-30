@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { claim, release, status } from '../src/claims.ts';
 import { CoworkError, EXIT } from '../src/errors.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
+import { removeTree } from './helpers.ts';
 
 const root = mkdtempSync(path.join(tmpdir(), 'cowork-claims-'));
 const laneDir = path.join(root, '.cowork', 'lanes', 'b');
@@ -38,7 +39,7 @@ after(() => {
   } catch {
     // 临时目录随后整体删除，失败无所谓
   }
-  rmSync(root, { recursive: true, force: true });
+  removeTree(root);
 });
 
 async function expectBusy(fn: () => Promise<unknown>): Promise<void> {

@@ -391,6 +391,9 @@ export async function next(info: RepoInfo, options: NextOptions = {}): Promise<N
 
   // 锁外：只为区分 exit 1/2，不参与写决策。
   const before = candidates(info, catalog, readWorld(state));
+  // 分支也要在锁外读：currentBranch 会 spawn git，不能放进短临界区。
+  const laneBranch = currentBranch(info.laneTop);
+  const claimBranch = currentBranch(lanePath);
 
   return withLock(
     state,
@@ -416,7 +419,7 @@ export async function next(info: RepoInfo, options: NextOptions = {}): Promise<N
         );
       }
       const task = after.tasks[0] as TaskSpec;
-      const acquired = acquire(info, state, catalog, task, agent, lane, lanePath);
+      const acquired = acquire(info, state, catalog, task, agent, lane, lanePath, laneBranch, claimBranch);
       return { ...acquired, task, specCommit: catalog.rev, recovery };
     },
     {
@@ -426,7 +429,7 @@ export async function next(info: RepoInfo, options: NextOptions = {}): Promise<N
   );
 }
 
-/** 锁内事务本体：intent → lease → claims → committed → 清 intent。 */
+/** 锁内事务本体：intent → lease → claims → committed → 清 intent。分支由调用方在锁外算好。 */
 function acquire(
   info: RepoInfo,
   state: string,
@@ -435,6 +438,8 @@ function acquire(
   agent: string,
   lane: string | null,
   lanePath: string,
+  laneBranch: string | null,
+  claimBranch: string | null,
 ): { live: TaskLive; claims: ClaimRecord[] } {
   const prev = readTaskLive(state, task.id);
   if (prev === null || prev.status !== 'ready') {
@@ -465,7 +470,7 @@ function acquire(
     lane,
     lane_path: lanePath,
     agent,
-    branch: currentBranch(info.laneTop),
+    branch: laneBranch,
     prev,
     claim_ids: ids,
     phase: 'pending',
@@ -481,7 +486,7 @@ function acquire(
       specCommit: catalog.rev,
       note: `next 领取（${catalog.trunk}@${catalog.rev.slice(0, 7)}）`,
     });
-    const claims = writeTaskClaims(state, lane, lanePath, task.id, agent, touches, ids, createdAt);
+    const claims = writeTaskClaims(state, lane, lanePath, task.id, agent, touches, ids, createdAt, claimBranch);
     writeIntent(state, { ...intent, phase: 'committed' });
     committed = true;
     removeIntent(state, operationId);
@@ -516,8 +521,8 @@ function writeTaskClaims(
   touches: readonly ClaimPath[],
   ids: readonly string[],
   createdAt: string,
+  branch: string | null,
 ): ClaimRecord[] {
-  const branch = currentBranch(lanePath);
   const host = hostname();
   const ttlMs = claimTtlMs();
   const records: ClaimRecord[] = touches.map((touch, index) => ({

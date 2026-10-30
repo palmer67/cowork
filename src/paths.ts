@@ -1,6 +1,6 @@
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { general } from './errors.ts';
+import { env, general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 
 export type ClaimKind = 'file' | 'prefix';
@@ -52,21 +52,49 @@ function statIsDir(abs: string): boolean {
   }
 }
 
-/** 用 realpath 消歧（8.3 短名、junction、大小写），失败时退回原路径。 */
+/**
+ * 解析路径的真实位置：叶子不存在时（例如 claim 一个还没创建的文件），
+ * 退到最近的已存在祖先做 realpath，再把剩下的段接回去。
+ * 这样 junction 指向仓库外时，即使叶子缺失也不能绕过越界检查。
+ */
+function realLocation(abs: string): { real: string; missing: string[] } {
+  let probe = abs;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return { real: realpathSync.native(probe), missing };
+    } catch {
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        throw env(
+          `无法解析路径的真实位置: ${abs}`,
+          '路径不可访问或没有权限；cowork 需要能读取路径上的目录来规范化。',
+        );
+      }
+      missing.unshift(path.basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+/** 用 realpath 消歧（8.3 短名、junction、大小写）；解析结果必须仍在车道内。 */
 function realKey(laneTop: string, key: string): string {
   const abs = path.resolve(laneTop, ...key.split('/'));
-  let realAbs: string;
   let realLane: string;
   try {
-    realAbs = realpathSync.native(abs);
     realLane = realpathSync.native(laneTop);
   } catch {
-    return key;
+    throw env(
+      `无法解析车道根: ${laneTop}`,
+      '目录不存在或没有读取权限；先在车道根确认 cowork 能访问路径。',
+    );
   }
+  const resolved = realLocation(abs);
+  const realAbs = path.join(resolved.real, ...resolved.missing);
   const rel = path.relative(realLane, realAbs);
   if (rel === '') return '';
   if (rel.startsWith('..') || path.isAbsolute(rel)) {
-    throw general(
+    throw env(
       `路径解析后落在仓库之外: ${key}`,
       '符号链接/junction 指向了仓库外部，cowork 不跟踪仓库外的文件。',
     );

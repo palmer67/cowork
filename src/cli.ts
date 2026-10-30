@@ -341,9 +341,16 @@ async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {
     console.log('运行 cowork doctor --fix 清理。');
     return EXIT.OK;
   }
-  const pruned = await doctorFix(info);
-  for (const rec of pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
-  if (pruned.length === 0) console.log('未发现过期占位。');
+  const report = await doctorFix(info);
+  for (const rec of report.pruned) console.log(`已清理 ${rec.display}（${describeAgent(rec)}，已过期）`);
+  for (const item of report.quarantined) {
+    const where = item.trash === null ? '隔离失败，原文件仍在' : `已隔离到 ${item.trash}`;
+    console.log(`已隔离损坏状态文件 ${item.path}：${where}`);
+    console.log(`  → ${item.reason}`);
+  }
+  if (report.pruned.length === 0 && report.quarantined.length === 0) {
+    console.log('未发现过期占位或损坏状态。');
+  }
   return EXIT.OK;
 }
 

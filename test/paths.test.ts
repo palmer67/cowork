@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { after, test } from 'node:test';
@@ -8,10 +8,12 @@ import type { RepoInfo } from '../src/git.ts';
 import { conflicts, parseClaim } from '../src/paths.ts';
 
 const root = mkdtempSync(path.join(tmpdir(), 'cowork-paths-'));
+const outside = mkdtempSync(path.join(tmpdir(), 'cowork-paths-outside-'));
 mkdirSync(path.join(root, 'src', 'auth'), { recursive: true });
 writeFileSync(path.join(root, 'src', 'auth', 'login.ts'), 'export {}\n', 'utf8');
 mkdirSync(path.join(root, 'docs'), { recursive: true });
 writeFileSync(path.join(root, 'docs', 'a.md'), '# a\n', 'utf8');
+mkdirSync(path.join(outside, 'secret'), { recursive: true });
 
 const info: RepoInfo = {
   laneTop: root,
@@ -20,7 +22,10 @@ const info: RepoInfo = {
   laneName: null,
 };
 
-after(() => rmSync(root, { recursive: true, force: true }));
+after(() => {
+  rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  rmSync(outside, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+});
 
 function codeOf(fn: () => unknown): number {
   try {
@@ -87,4 +92,20 @@ test('同一相对路径在两条车道里必须得到同一个 key', () => {
   writeFileSync(path.join(laneRoot, 'src', 'auth', 'login.ts'), 'export {}\n', 'utf8');
   const laneInfo: RepoInfo = { laneTop: laneRoot, commonDir: info.commonDir, mainRoot: root, laneName: 'b' };
   assert.equal(parseClaim('src/auth/login.ts', laneInfo).key, parseClaim('src/auth/login.ts', info).key);
+});
+
+test('junction 指向仓库外时，叶子不存在也不能绕过越界检查', () => {
+  const escape = path.join(root, 'escape');
+  symlinkSync(outside, escape, 'junction');
+
+  // 叶子不存在：realpath 会失败，必须退到最近的已存在祖先（escape）再判断。
+  assert.equal(codeOf(() => parseClaim('escape/new.ts', info)), EXIT.ENV);
+  // 叶子存在也一样要拒绝。
+  assert.equal(codeOf(() => parseClaim('escape/secret/hidden.ts', info)), EXIT.ENV);
+  // junction 本身作为目录前缀也不能声明。
+  assert.equal(codeOf(() => parseClaim('escape', info)), EXIT.ENV);
+  assert.equal(codeOf(() => parseClaim('escape/**', info)), EXIT.ENV);
+
+  // 仓库内的普通路径不受影响。
+  assert.equal(parseClaim('src/auth/login.ts', info).key, 'src/auth/login.ts');
 });

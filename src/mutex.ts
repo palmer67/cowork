@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { CoworkError, EXIT, busy } from './errors.ts';
@@ -12,13 +12,16 @@ export interface LockOwner {
 
 export interface LockOptions {
   timeoutMs?: number;
-  staleMs?: number;
   /** 等待期间回调，用于给用户一个"在等谁"的提示。 */
   onWait?: (owner: LockOwner | null) => void;
+  /**
+   * false 表示只读调用：stateRoot 不存在时直接执行 fn，不为了看一眼把它建出来。
+   * 写命令永远用默认 true（先 ensureState 再进来）。
+   */
+  createStateDir?: boolean;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
-const DEFAULT_STALE_MS = 60_000;
 
 /** 同一进程内已持有的锁目录：重复加锁会自锁死，直接报错。 */
 const held = new Set<string>();
@@ -60,7 +63,11 @@ function tryAcquire(lockDir: string): LockOwner | null {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'EEXIST') return null;
-    throw new CoworkError(EXIT.ENV, `无法创建锁目录 ${lockDir}: ${code ?? String(err)}`, '检查磁盘权限与路径长度。');
+    throw new CoworkError(
+      EXIT.GENERAL,
+      `无法创建锁目录 ${lockDir}: ${code ?? String(err)}`,
+      '检查状态目录是否可写、父路径是否是目录；修好后再重试。',
+    );
   }
   const owner: LockOwner = {
     pid: process.pid,
@@ -72,27 +79,28 @@ function tryAcquire(lockDir: string): LockOwner | null {
     writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify(owner), 'utf8');
   } catch (err) {
     rmSync(lockDir, { recursive: true, force: true });
-    throw new CoworkError(EXIT.ENV, `无法写入 owner.json: ${String(err)}`, '检查磁盘权限。');
+    throw new CoworkError(
+      EXIT.GENERAL,
+      `无法写入 owner.json: ${String(err)}`,
+      '检查状态目录的磁盘权限与剩余空间。',
+    );
   }
   return owner;
 }
 
-function isStale(lockDir: string, owner: LockOwner | null, staleMs: number): boolean {
-  const now = Date.now();
+function isStale(lockDir: string, owner: LockOwner | null): boolean {
   if (owner === null) {
     // 目录已建但 owner.json 还没写：可能是刚抢到锁的瞬间，也可能是崩溃。
     try {
-      const age = now - statSync(lockDir).mtimeMs;
-      return age > 5_000;
+      return Date.now() - statSync(lockDir).mtimeMs > 5_000;
     } catch {
       return false;
     }
   }
   if (owner.host !== hostname()) return false; // 跨机器不做活体判断，交给 timeout
-  if (!pidAlive(owner.pid)) return true;
-  const acquired = Date.parse(owner.acquiredAt);
-  if (Number.isFinite(acquired) && now - acquired > staleMs) return true;
-  return false;
+  // 只按"进程是否还活着"回收：锁龄长不代表持有者死了。长操作（比如一条很慢的命令）
+  // 如果被按时间抢走锁，原持有者收尾时还会删掉新锁，等于没有互斥。
+  return !pidAlive(owner.pid);
 }
 
 /** 把残留锁挪到 trash，避免直接删除时与别人竞争。 */
@@ -114,6 +122,21 @@ function describe(owner: LockOwner | null): string {
 }
 
 /**
+ * 释放锁前核对 token：如果锁已被回收并被别人重建，旧持有者绝不能删掉新锁。
+ * 这种情况说明本次临界区并没有独占，必须显式说出来，而不是假装正常结束。
+ */
+function releaseLock(lockDir: string, own: LockOwner): void {
+  const current = readOwner(lockDir);
+  if (current !== null && current.token === own.token) {
+    rmSync(lockDir, { recursive: true, force: true });
+    return;
+  }
+  console.warn(
+    `cowork: 锁已被回收，本次未独占: ${lockDir}（当前持有者: ${describe(current)}）。未删除他人锁。`,
+  );
+}
+
+/**
  * 全局互斥。临界区必须短：不得在里面跑 git、测试或遍历文件树。
  * 拿不到锁时退出 2，并说明占用者与解决方式。
  */
@@ -124,7 +147,6 @@ export async function withLock<T>(
 ): Promise<T> {
   const lockDir = path.join(stateRoot, 'lock');
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const staleMs = options.staleMs ?? DEFAULT_STALE_MS;
 
   if (held.has(lockDir)) {
     throw new CoworkError(
@@ -134,8 +156,20 @@ export async function withLock<T>(
     );
   }
 
-  mkdirSync(stateRoot, { recursive: true });
-  const deadline = Date.now() + timeoutMs;
+  if (options.createStateDir === false && !existsSync(stateRoot)) {
+    // 只读调用（比如 snapshot）：还没有 live 状态目录，就说明还没有 writer 需要持锁。
+    // 为了看一眼而把 <common>/cowork 建出来属于写入副作用，这里直接执行回调。
+    return await fn();
+  }
+  try {
+    mkdirSync(stateRoot, { recursive: true });
+  } catch (err) {
+    throw new CoworkError(
+      EXIT.GENERAL,
+      `无法创建状态目录 ${stateRoot}: ${(err as NodeJS.ErrnoException).code ?? String(err)}`,
+      '检查 .git 目录的权限与父路径；修好后运行 cowork doctor --fix。',
+    );
+  }  const deadline = Date.now() + timeoutMs;
   let notified = false;
 
   for (;;) {
@@ -146,12 +180,12 @@ export async function withLock<T>(
         return await fn();
       } finally {
         held.delete(lockDir);
-        rmSync(lockDir, { recursive: true, force: true });
+        releaseLock(lockDir, owner);
       }
     }
 
     const current = readOwner(lockDir);
-    if (isStale(lockDir, current, staleMs)) {
+    if (isStale(lockDir, current)) {
       reap(lockDir, stateRoot);
       continue;
     }

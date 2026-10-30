@@ -5,8 +5,12 @@ import { withLock } from './mutex.ts';
 import { conflicts, formatClaim, parseClaim, type ClaimPath } from './paths.ts';
 import {
   asClaimPath,
+  claimFilePath,
   ensureState,
+  listClaimIds,
   listClaims,
+  quarantineClaim,
+  readClaim,
   removeClaim,
   stateRoot,
   uniqueClaimId,
@@ -223,16 +227,42 @@ export async function status(info: RepoInfo): Promise<StatusReport> {
   });
 }
 
-/** 回收过期占位，返回清掉的记录。 */
-export async function doctorFix(info: RepoInfo): Promise<ClaimRecord[]> {
+export interface QuarantinedClaim {
+  /** 原来的 claim 文件路径。 */
+  path: string;
+  /** 移到 trash 后的路径；移动失败为 null。 */
+  trash: string | null;
+  reason: string;
+}
+
+export interface DoctorReport {
+  /** 过期并已回收的占位。 */
+  pruned: ClaimRecord[];
+  /** 损坏并被隔离的状态文件。 */
+  quarantined: QuarantinedClaim[];
+}
+
+/**
+ * 回收过期占位，隔离损坏的状态文件。坏文件不能静默跳过：
+ * 跳过等于把"读不到"伪装成"没有占位"，两个 agent 会同时改一个文件。
+ */
+export async function doctorFix(info: RepoInfo): Promise<DoctorReport> {
   const state = stateRoot(info);
   ensureState(state);
   return withLock(state, () => {
     const pruned: ClaimRecord[] = [];
+    const quarantined: QuarantinedClaim[] = [];
     const now = Date.now();
-    for (const rec of listClaims(state)) {
-      if (isExpired(rec, now) && removeClaim(state, rec.id)) pruned.push(rec);
+    for (const id of listClaimIds(state)) {
+      const path = claimFilePath(state, id);
+      try {
+        const rec = readClaim(state, id);
+        if (rec !== null && isExpired(rec, now) && removeClaim(state, rec.id)) pruned.push(rec);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        quarantined.push({ path, trash: quarantineClaim(state, id), reason });
+      }
     }
-    return pruned;
+    return { pruned, quarantined };
   });
 }

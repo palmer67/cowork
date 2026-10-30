@@ -9,6 +9,7 @@ import {
   existsSync,
 } from 'node:fs';
 import path from 'node:path';
+import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import type { ClaimKind, ClaimPath } from './paths.ts';
 
@@ -61,14 +62,74 @@ function claimFile(state: string, id: string): string {
   return path.join(claimsDir(state), `${id}.json`);
 }
 
+/** claim 文件的绝对路径，供 doctor 报告隔离结果。 */
+export function claimFilePath(state: string, id: string): string {
+  return claimFile(state, id);
+}
+
+const CLAIM_KINDS: readonly string[] = ['file', 'prefix'];
+
+/**
+ * 运行时校验：状态文件是跨进程、跨 agent 的共享真相，坏字段不能当默认值读。
+ * pid/agent/host 会被渲染到面板里，类型不对就按损坏处理。
+ */
+function asClaimRecord(raw: unknown, file: string): ClaimRecord {
+  const corrupt = (detail: string): never => {
+    throw general(
+      `状态文件损坏: ${file}（${detail}）`,
+      '运行 cowork doctor --fix 隔离损坏文件；再运行 cowork status 确认占位状态。',
+    );
+  };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) corrupt('不是 JSON 对象');
+  const rec = raw as Record<string, unknown>;
+  const str = (key: string): string => {
+    const value = rec[key];
+    if (typeof value !== 'string') corrupt(`${key} 不是字符串`);
+    return value as string;
+  };
+  const nullableStr = (key: string): string | null => {
+    const value = rec[key];
+    if (value === null) return null;
+    if (typeof value !== 'string') corrupt(`${key} 不是字符串或 null`);
+    return value as string;
+  };
+  const id = str('id');
+  const kind = str('kind');
+  if (!CLAIM_KINDS.includes(kind)) corrupt(`kind 不是 file/prefix: ${kind}`);
+  const pid = rec['pid'];
+  if (typeof pid !== 'number' || !Number.isInteger(pid)) corrupt('pid 不是整数');
+  const ttlMs = rec['ttlMs'];
+  if (typeof ttlMs !== 'number' || !Number.isFinite(ttlMs)) corrupt('ttlMs 不是数字');
+  return {
+    id,
+    kind: kind as ClaimKind,
+    key: str('key'),
+    display: str('display'),
+    lane: nullableStr('lane'),
+    lanePath: str('lanePath'),
+    branch: nullableStr('branch'),
+    agentId: str('agentId'),
+    pid: pid as number,
+    host: str('host'),
+    note: nullableStr('note'),
+    createdAt: str('createdAt'),
+    ttlMs: ttlMs as number,
+  };
+}
+
 export function readClaim(state: string, id: string): ClaimRecord | null {
   const file = claimFile(state, id);
   if (!existsSync(file)) return null;
+  let raw: unknown;
   try {
-    return JSON.parse(readFileSync(file, 'utf8')) as ClaimRecord;
-  } catch {
-    return null;
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw general(
+      `状态文件损坏: ${file}（${err instanceof Error ? err.message : String(err)}）`,
+      '运行 cowork doctor --fix 隔离损坏文件；再运行 cowork status 确认占位状态。',
+    );
   }
+  return asClaimRecord(raw, file);
 }
 
 export function writeClaim(state: string, record: ClaimRecord): void {
@@ -85,12 +146,38 @@ export function removeClaim(state: string, id: string): boolean {
   return true;
 }
 
+/** claims 目录里登记的所有 id（不解析内容），doctor 用它逐条隔离坏文件。 */
+export function listClaimIds(state: string): string[] {
+  const dir = claimsDir(state);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .map((name) => name.slice(0, -'.json'.length))
+    .sort();
+}
+
+/** 把损坏的 claim 文件移到 trash；返回新的路径，移动失败返回 null。 */
+export function quarantineClaim(state: string, id: string): string | null {
+  const file = claimFile(state, id);
+  if (!existsSync(file)) return null;
+  const trash = path.join(state, 'trash');
+  mkdirSync(trash, { recursive: true });
+  const target = path.join(trash, `claim-${id}-${Date.now()}.json`);
+  try {
+    renameSync(file, target);
+    return target;
+  } catch {
+    return null;
+  }
+}
+
 export function listClaims(state: string): ClaimRecord[] {
   const dir = claimsDir(state);
   if (!existsSync(dir)) return [];
   const out: ClaimRecord[] = [];
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
+    // 坏文件不跳过：读不出来就抛错，让人先 doctor --fix，别把占位当不存在。
     const rec = readClaim(state, name.slice(0, -'.json'.length));
     if (rec !== null) out.push(rec);
   }

@@ -122,9 +122,7 @@ M1 的完成链路是 `ready → claimed → in_progress → reported_done → m
 
 状态：已定（2026-10-30），M1 实现时确定
 
-`task add` 生成的 id 形如 `t-1a2b3c`：`sha256(title + "
-" + created_at + "
-" + salt)`
+`task add` 生成的 id 形如 `t-1a2b3c`：`sha256(title + "\n" + created_at + "\n" + salt)`
 的前 6 位十六进制。它与创建顺序、标题排序、时间都无单调关系，只用于稳定引用。
 
 理由：
@@ -174,8 +172,39 @@ live 与 claims，用它们算候选集 `C`。这是有界例外，靠三条约�
   touches/依赖判断一致；
 - 依赖只认 `merged`，旧 catalog 最多让「刚 merged 的依赖」晚一轮才可见，不会把未 merged 的
   任务放出来；
-- 兜底在 doctor：检查 lease 的 `spec_commit` 是否仍是 trunk 祖先、依赖是否存在/成环、
-  live 是否损坏；任何一项异常都 exit 1，不静默通过。
+- 兜底在 doctor：检查 lease 记录的 spec 内容是否仍与 trunk 当前一致（blob 比较，见 A1）、
+  依赖是否存在/成环、live 是否损坏；任何一项异常都 exit 1，不静默通过。
 
 代价是「严格线性一致」不成立；换来的是锁内不跑 git、临界区保持毫秒级。M2 如需强一致，
 应把 catalog 的 commit 写进 intent 并在锁内校验，而不是把 git 塞进锁里。
+
+## A1 — spec 漂移用 blob 比较，不用祖先判断
+
+状态：已定（2026-10-31，M1 代码评审后）
+
+doctor 判断 lease 的 `spec_commit` 是否还指向当前 spec，改用内容比较：
+
+```
+git rev-parse <spec_commit>:.cowork/tasks/<id>.md
+git rev-parse <trunk>:.cowork/tasks/<id>.md
+```
+
+两者必须相等。`merge-base --is-ancestor <spec_commit> <trunk>` 只说明那次提交在 trunk 历史里：
+trunk 正常前进后再改写同一份 spec，旧提交仍是祖先，检查会漏掉——正在跑的任务被悄悄换了验收标准。
+
+不一致 → exit 1，提示 `cowork task cancel` 后从 trunk 重新 `ready`（ready 之后 spec 不可改写，这是
+唯一正确的恢复路径）。代价是每次 doctor 多两次 `git rev-parse`（O(1)），且要求该文件在 trunk 里存在。
+
+## A2 — `--manual` 是无身份的人工信任边界
+
+状态：已定（2026-10-31，M1 代码评审后）
+
+`confirm-merge` 只认 `--manual --reason`，但 CLI 不校验「谁」按下的确认：任何对仓库有写权限的人
+或 agent 都能把 `reported_done` 推到 `merged`。这是显式的信任边界——cowork M1 不做身份系统，
+也不假装有：
+
+- 审计靠 `merged` 历史里的 note（合并 sha、`--reason`、执行者 agent）与 git 本身的提交记录；
+- `--reason` 是必填项，保证事后能看出依据，而不是一句空确认；
+- M2 的自动验证结果才是机器证据；`--manual` 仍保留为逃生门，但同样必须写明理由。
+
+若要更强约束，需要的是仓库外的身份/审批系统，而不是在这个 CLI 里加一层可伪造的参数。

@@ -113,7 +113,7 @@
 5. 事务：写 `next` intent（operation id、task id、lane、旧状态、拟写 claim ids）→ 写 task lease
    → 写全部 touches claims → 标记 intent `committed` → 清除 intent。
 6. **全占或全不占**：任一步失败，在锁内按 intent 幂等回滚已写记录，任务状态不变；回滚失败
-   标记 `corrupt` 并 **fail closed**（exit 3 或 1，绝不把任务开放给第二个 owner）。
+   标记 `corrupt` 并 **fail closed**（exit 1，绝不把任务开放给第二个 owner）。
 7. 恢复：任何命令取得锁后先扫 intents。无 `committed` → 按 intent 回滚；有 `committed` →
    核对 task lease 与全部 claims 齐全，缺一个就 `corrupt` + fail closed。
 8. **锁内不跑 git**（协议 §7）：catalog 已在锁外读进内存；锁内只做 live 文件的读写。

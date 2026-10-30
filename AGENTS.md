@@ -13,7 +13,7 @@
 
 - ❌ 不自动拆解任务、不做 LLM 调度、不启动或推送任务给 Codex/DSH 等 agent；agent 通过拉模式调用 `cowork next` 自行领取
 - ❌ 不做自动 fan-out；并行边界只由依赖、touches、claim 规则确定
-- ❌ 不做 Web UI / 桌面面板（CLI 优先，`--json` 供将来接 GUI）
+- ✅ 只读看板是 P0；数据只经 `cowork snapshot --json` 提供，唯一写者仍是 CLI；不做写操作后台，不用 Electron
 - ❌ 不用 Docker / WSL / 后台守护进程
 - ❌ 不修改 Codex、DSH 等 agent 的安装或二进制
 - ❌ 不做 AST 级自动合并，冲突检测只到文件 + hunk 重叠

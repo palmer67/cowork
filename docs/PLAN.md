@@ -46,7 +46,7 @@
 ## 2. 非目标（明确不做）
 
 1. 有任务层，但智能在 agent 侧（人 + agent 拆任务）；cowork 只负责纪律（队列、依赖、占位、汇总）。不做自动拆解、不做 LLM 调度、不启动 agent 进程或推送派工。Agent 通过拉模式自行调用 `cowork next` 领取可执行任务。详见 `docs/ARCHITECTURE-TASKS.md`。
-2. 不做 Web UI 或桌面面板。CLI 优先，`--json` 供将来接 GUI。
+2. 只读看板是 P0；数据只经 `cowork snapshot --json` 提供，唯一写者仍是 CLI。不做写操作后台，不用 Electron。
 3. 不用容器、不用 Docker、不用 WSL、不起后台守护进程。
 4. 不改 Codex / DSH 的安装或二进制。只能通过 AGENTS.md、git hook、CLI、可选的 MCP server 接入。
 5. 不做代码语义理解 / AST 级自动合并。冲突检测只到"文件 + hunk 重叠"这一层，够用即可。
@@ -203,7 +203,7 @@ cowork doctor [--fix]
 2. Windows 并发原语是不是真的验证过，还是照搬了 Linux 的 `flock`？
 3. 崩溃恢复是不是闭环（能不能不靠人手工删文件恢复）？
 4. 是不是把"agent 会不自觉"当成一等公民（否则工具很好但没人用）？
-5. 有没有偷偷膨胀成调度器/看板（超出非目标就该砍）。
+5. 看板是否严格只读且仅消费 `cowork snapshot --json`，有没有扩展成写操作后台或调度器。
 
 ---
 

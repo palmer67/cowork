@@ -12,6 +12,17 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      legacy_acceptance_suites:
+        description: Run embedded npm test and tsc for same-commit timing comparison
+        required: false
+        default: false
+        type: boolean
+      run_stress:
+        description: Run the concurrency stress job
+        required: false
+        default: true
+        type: boolean
   schedule:
     # 每周一 03:17 UTC（北京时间 11:17）跑一次压测，抓偶发竞态
     - cron: '17 3 * * 1'
@@ -60,14 +71,22 @@ jobs:
         run: npm run build
 
       - name: M1 验收（10 条）
-        run: node tools/accept-m1.mjs
+        env:
+          COWORK_ACCEPT_SKIP_SUITE: '1'
+        run: |
+          if [[ '${{ inputs.legacy_acceptance_suites }}' == 'true' ]]; then unset COWORK_ACCEPT_SKIP_SUITE; fi
+          node tools/accept-m1.mjs
 
       - name: 面板验收（13 条）
-        run: node tools/accept-panel.mjs
+        env:
+          COWORK_ACCEPT_SKIP_SUITE: '1'
+        run: |
+          if [[ '${{ inputs.legacy_acceptance_suites }}' == 'true' ]]; then unset COWORK_ACCEPT_SKIP_SUITE; fi
+          node tools/accept-panel.mjs
 
   stress:
     name: 并发压测（20 轮）
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_stress)
     runs-on: windows-latest
     timeout-minutes: 40
     steps:

@@ -1,0 +1,84 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 每周一 03:17 UTC（北京时间 11:17）跑一次压测，抓偶发竞态
+    - cron: '17 3 * * 1'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # 测试自己会在临时仓库里设置 user.name/user.email；这里只固定换行与编码，避免 diff 噪音
+  GIT_CONFIG_NOSYSTEM: '1'
+  CI: 'true'
+
+jobs:
+  gate:
+    name: 门禁（测试 / 类型 / 构建 / 验收）
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 单元与集成测试
+        run: npm test
+
+      - name: 类型检查
+        run: npx tsc --noEmit
+
+      - name: 构建
+        run: npm run build
+
+      - name: M1 验收（10 条）
+        run: node tools/accept-m1.mjs
+
+      - name: 面板验收（13 条）
+        run: node tools/accept-panel.mjs
+
+  stress:
+    name: 并发压测（20 轮）
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci --no-audit --no-fund
+
+      - name: 构建
+        run: npm run build
+
+      - name: 20 轮多进程压测
+        run: |
+          for i in $(seq 1 20); do
+            echo "::group::round $i"
+            node --experimental-strip-types --test \
+              test/tasknext-concurrency.test.ts \
+              test/mutex-concurrency.test.ts
+            echo "::endgroup::"
+          done

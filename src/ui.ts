@@ -6,8 +6,8 @@ import path from 'node:path';
 import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { snapshot } from './snapshot.ts';
+import type { ContractAlert } from './contracts.ts';
 import type {
-  ContractAlert,
   Snapshot,
   SnapshotClaim,
   SnapshotHandoff,
@@ -62,7 +62,10 @@ function diagnosticsCell(lane: SnapshotLane): string {
 }
 
 function actionButton(label: string, route: string, command: string, serve: boolean, reason = '', form = ''): string {
-  if (!serve) return `<button type="button" data-copy="${escapeHtml(command)}" title="${escapeHtml(command)}">复制命令</button>`;
+  if (!serve || route === '') {
+    const copyLabel = label === '' ? '复制命令' : label;
+    return `<button type="button" data-copy="${escapeHtml(command)}" title="${escapeHtml(command)}">${escapeHtml(copyLabel)}</button>`;
+  }
   return `<button type="button" data-api="${escapeHtml(route)}" data-command="${escapeHtml(command)}"${form === '' ? '' : ` data-form="${escapeHtml(form)}"`}${reason === '' ? '' : ` disabled title="${escapeHtml(reason)}"`}>${escapeHtml(label)}</button>`;
 }
 
@@ -152,6 +155,9 @@ const STATUS_TONES: Record<string, 'ok' | 'warn' | 'bad' | undefined> = {
   merged: 'ok',
   cancelled: 'bad',
   blocked: 'bad',
+  verify_failed: 'bad',
+  awaiting_merge: 'ok',
+  verifying: 'warn',
   reported_done: 'warn',
   in_progress: 'warn',
   ready: 'warn',
@@ -163,13 +169,15 @@ function statusBadge(status: string): string {
 
 function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options: RenderOptions): string {
   if (!options.serve) {
-    const action = task.status === 'draft' ? 'ready' : task.status === 'claimed' ? 'start' : task.status === 'in_progress' ? 'report-done' : task.status === 'reported_done' ? 'confirm-merge' : 'show';
-    return actionButton('', '', `cowork task ${action} ${task.id}${action === 'confirm-merge' ? ' --commit <sha> --manual --reason "<依据>"' : ''}`, false);
+    const retry = task.status === 'verify_failed' || (task.status === 'reported_done' && task.verification?.status === 'failed');
+    const action = task.status === 'draft' || task.status === 'blocked' ? 'ready' : task.status === 'claimed' ? 'start' : task.status === 'in_progress' ? 'report-done' : task.status === 'reported_done' || task.status === 'verify_failed' ? 'done' : task.status === 'awaiting_merge' ? 'confirm-merge' : 'show';
+    const label = retry ? '重跑验证' : task.status === 'reported_done' ? '运行验证' : '';
+    return actionButton(label, '', `cowork task ${action} ${task.id}${action === 'confirm-merge' ? ' --commit <sha>' : ''}`, false);
   }
   const invalidLane = task.assigned_lane === null ? false : !lanes.some((lane) => lane.lane === task.assigned_lane && lane.error === undefined);
   const definitions: [string, string, string[]][] = [
-    ['ready', '审核就绪', ['draft']], ['start', '开始', ['claimed']], ['report-done', '标记完成', ['in_progress']],
-    ['confirm-merge', '确认合并', ['reported_done']], ['block', '标记阻塞', ['claimed', 'in_progress']],
+    ['ready', '审核就绪', ['draft', 'blocked']], ['start', '开始', ['claimed', 'blocked']], ['report-done', '标记完成', ['in_progress']],
+    ['confirm-merge', '确认合并', ['awaiting_merge']], ['block', '标记阻塞', ['claimed', 'in_progress', 'reported_done', 'verifying', 'verify_failed', 'awaiting_merge']],
     ['cancel', '取消任务', ['draft', 'ready', 'claimed', 'in_progress', 'reported_done', 'blocked', 'merged']],
   ];
   const panelAgent = options.panelAgent ?? 'default';
@@ -181,7 +189,8 @@ function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options
     const mismatch = needsOwner && !ownerMatches;
     ownerMismatch ||= mismatch;
     const ownerReason = `需在车道 ${task.assigned_lane ?? '(main)'} 内由 ${task.agent ?? '未声明'} 执行`;
-    const reason = mismatch ? ownerReason : invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${states.join(' / ')} 可用` : '';
+    const availableStates = task.status === 'blocked' ? states : states.filter((status) => status !== 'blocked');
+    const reason = mismatch ? ownerReason : invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${availableStates.join(' / ')} 可用` : '';
     const form = action === 'confirm-merge' || action === 'block' || action === 'cancel' ? action : '';
     return actionButton(label, `/api/task/${encodeURIComponent(task.id)}/${action}`, `cowork task ${action} ${task.id}`, true, reason, form);
   }).join('');
@@ -190,10 +199,40 @@ function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options
   const ownerCommand = ownerMismatch
     ? `<div class="sub mono"><code class="mono">cowork task start ${escapeHtml(task.id)}</code>${actionButton('', '', `cowork task start ${task.id}`, false)}</div>`
     : '';
-  return buttons + dispatch + ownerCommand;
+  const retry = task.status === 'verify_failed' || (task.status === 'reported_done' && task.verification?.status === 'failed')
+    ? actionButton('重跑验证', '', `cowork task done ${task.id}`, true)
+    : '';
+  return buttons + retry + dispatch + ownerCommand;
 }
 
-function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLane[] = [], options: RenderOptions = {}): string {
+function verificationDetails(task: SnapshotTask): string {
+  const verification = task.verification ?? null;
+  if (verification === null) return '';
+  const relevant = ['verifying', 'verify_failed', 'awaiting_merge', 'reported_done', 'blocked'].includes(task.status);
+  if (!relevant) return '';
+  const latest = verification.records.at(-1);
+  const status = verification.status === 'running' ? '验证中' : verification.status === 'passed' ? '通过' : verification.status === 'stale' ? '已恢复' : '失败';
+  const record = latest === undefined
+    ? ''
+    : `<div class="sub mono">${escapeHtml(latest.name)} · exit=${escapeHtml(String(latest.exit))} · ${escapeHtml(latest.duration_ms)}ms</div>`;
+  const pidError = verification.pid_start_error
+    ? `<div class="sub">PID 启动时间不可得: ${escapeHtml(verification.pid_start_error)}</div>`
+    : '';
+  const summary = verification.summary === '' ? '' : `<div class="sub">${escapeHtml(verification.summary)}</div>`;
+  return `<div class="sub">验证 ${status} · config ${escapeHtml(verification.config_commit.slice(0, 7))}</div>${record}${pidError}${summary}`;
+}
+
+function taskContractCell(task: SnapshotTask, alerts: readonly ContractAlert[]): string {
+  const matching = alerts.filter((alert) => alert.task === task.id || alert.peer_task === task.id);
+  if (matching.length === 0) return '<span class="sub">—</span>';
+  const details = matching.map((alert) => {
+    const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
+    return `<li>${escapeHtml(alert.kind)} · ${escapeHtml(alert.path)} · ${escapeHtml(source || '未说明来源')} · ${escapeHtml(alert.summary)}</li>`;
+  }).join('');
+  return `${badge(String(matching.length), 'warn')}<details><summary>来源</summary><ul class="diag">${details}</ul></details>`;
+}
+
+function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLane[] = [], options: RenderOptions = {}, alerts: readonly ContractAlert[] = []): string {
   if (tasks.length === 0) {
     return '<p class="empty">还没有任务。cowork task add 创建 spec，cowork next 领取。</p>';
   }
@@ -213,37 +252,41 @@ function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLan
         task.spec_commit === null
           ? '<span class="sub">—</span>'
           : `<span class="mono">${escapeHtml(task.spec_commit.slice(0, 7))}</span>`;
+      const unverified = task.status === 'reported_done' ? badge('未验证', 'warn') : '';
       return `<tr>
   <td><span class="mono">${escapeHtml(task.id)}</span><div>${escapeHtml(task.title)}</div>${blocked}</td>
-  <td>${statusBadge(task.status)}</td>
+  <td>${statusBadge(task.status)}${unverified}${verificationDetails(task)}</td>
   <td>${lane}${agent}</td>
   <td>${deps}</td>
   <td>${spec}</td>
+  <td>${taskContractCell(task, alerts)}</td>
   <td class="actions">${taskActions(task, lanes, options)}</td>
 </tr>`;
     })
     .join('');
   return `<table>
-<thead><tr><th>任务</th><th>状态</th><th>车道 / agent</th><th>依赖</th><th>spec</th><th>操作</th></tr></thead>
+<thead><tr><th>任务</th><th>状态</th><th>车道 / agent</th><th>依赖</th><th>spec</th><th>契约</th><th>操作</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>`;
 }
 
-/** §8 唯一的契约提醒：本任务 reads 与另一活跃任务 touches 重叠。 */
+/** Structured read/write and handoff contract reminders. */
 function renderAlerts(alerts: readonly ContractAlert[]): string {
   if (alerts.length === 0) return '';
   const rows = alerts
     .map(
       (alert) => `<tr>
+  <td>${escapeHtml(alert.kind)}</td>
   <td><span class="mono">${escapeHtml(alert.task)}</span></td>
   <td><span class="mono">${escapeHtml(alert.path)}</span></td>
-  <td><span class="mono">${escapeHtml(alert.peer_task)}</span></td>
+  <td>${escapeHtml([alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ') || '未说明')}</td>
+  <td>${escapeHtml(alert.summary)}</td>
 </tr>`,
     )
     .join('');
-  return `<h3 class="sub">契约提醒（reads ↔ 其他任务的 touches）</h3>
+  return `<h3 class="sub">契约提醒</h3>
 <table>
-<thead><tr><th>读方任务</th><th>路径</th><th>写方任务</th></tr></thead>
+<thead><tr><th>类型</th><th>任务</th><th>路径</th><th>来源</th><th>说明</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>`;
 }
@@ -348,7 +391,7 @@ export function renderBoard(snap: Snapshot, options: RenderOptions = {}): string
 </section>
 <section class="card">
   <div class="card-head"><h2>任务与契约</h2><span class="sub">${snap.tasks.length} 个${blockedTasks > 0 ? `，${blockedTasks} 个被阻塞` : ''}${snap.task_diagnostics.length > 0 ? `，${snap.task_diagnostics.length} 条读取失败` : ''}</span></div>
-  <div class="card-body table-wrap">${renderTasks(snap.tasks, snap.lanes, taskOptions)}${renderTaskDiagnostics(snap.task_diagnostics)}${renderAlerts(snap.contract_alerts)}</div>
+  <div class="card-body table-wrap">${renderTasks(snap.tasks, snap.lanes, taskOptions, snap.contract_alerts)}${renderTaskDiagnostics(snap.task_diagnostics)}${renderAlerts(snap.contract_alerts)}</div>
 </section>`;
 }
 
@@ -382,7 +425,7 @@ const FORMS = `<div class="panel-toolbar">
 
 function panelScript(): string {
   // 函数源码没有用户数据；共享服务器与浏览器渲染，避免双份表格模板漂移。
-  const helpers = [escapeHtml, localTime, badge, changesCell, handoffCell, diagnosticsCell, actionButton, renderLanes, renderClaims, statusBadge, taskActions, renderTasks, renderAlerts, renderTaskDiagnostics, renderBoard];
+const helpers = [escapeHtml, localTime, badge, changesCell, handoffCell, diagnosticsCell, actionButton, renderLanes, renderClaims, statusBadge, taskActions, verificationDetails, taskContractCell, renderTasks, renderAlerts, renderTaskDiagnostics, renderBoard];
   const renderer = `const HTML_ESCAPES=${JSON.stringify(HTML_ESCAPES)};const STATUS_TONES=${JSON.stringify(STATUS_TONES)};` + helpers.map((fn) => `const ${fn.name}=${fn.toString()};`).join('\n');
   return `<script>
 (() => {

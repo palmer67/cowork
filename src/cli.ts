@@ -668,6 +668,13 @@ async function runNext(info: RepoInfo, args: Args): Promise<number> {
   console.log(`  done_when: ${result.task.done_when.join('; ') || '(空)'}`);
   console.log(`  lane: ${result.live.lane ?? '(main)'}  agent: ${agent}`);
   console.log(`  spec_commit: ${result.specCommit}`);
+  if (result.contract_alerts.length > 0) {
+    console.log('契约提醒:');
+    for (const alert of result.contract_alerts) {
+      const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
+      console.log(`  ${alert.kind}: ${alert.path} ← ${source || alert.summary}${source ? `（${alert.summary}）` : ''}`);
+    }
+  }
   console.log('下一步: cowork task start ' + result.task.id);
   return EXIT.OK;
 }

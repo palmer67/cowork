@@ -1,7 +1,9 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { busy, CoworkError, general } from './errors.ts';
 import { git, gitTry, type RepoInfo } from './git.ts';
+import { buildContractAlerts, type ContractTask } from './contracts.ts';
+import { readHandoffs, readRepositoryHandoffs } from './handoffs.ts';
 import { withLock } from './mutex.ts';
 import { agentId } from './claims.ts';
 import { conflicts, formatClaim, parseClaim } from './paths.ts';
@@ -406,42 +408,10 @@ export async function cancelTask(
   });
 }
 
-function noteSummary(file: string): { id: string; at: string; title: string } | null {
-  try {
-    const text = readFileSync(file, 'utf8');
-    const first = text.indexOf('---');
-    if (first < 0) return null;
-    const second = text.indexOf('---', first + 3);
-    if (second < 0) return null;
-    const meta = JSON.parse(text.slice(first + 3, second)) as Record<string, unknown>;
-    const id = typeof meta['id'] === 'string' ? meta['id'] : path.basename(file, '.md');
-    const at =
-      typeof meta['createdAt'] === 'string'
-        ? meta['createdAt']
-        : typeof meta['at'] === 'string'
-          ? meta['at']
-          : '';
-    const title =
-      typeof meta['task'] === 'string'
-        ? meta['task']
-        : (text.slice(second + 3).match(/^#\s+(.+)$/m)?.[1] ?? path.basename(file, '.md'));
-    return { id, at, title };
-  } catch {
-    return null;
-  }
-}
-
 export function recentHandoffs(info: RepoInfo, limit = 3): { id: string; at: string; title: string }[] {
-  const dir = path.join(info.laneTop, '.cowork', 'notes');
-  let names: string[];
-  try {
-    names = readdirSync(dir).filter((name) => name.endsWith('.md'));
-  } catch {
-    return [];
-  }
-  return names
-    .map((name) => noteSummary(path.join(dir, name)))
-    .filter((item): item is { id: string; at: string; title: string } => item !== null)
+  const handoffs = readHandoffs(path.join(info.laneTop, '.cowork', 'notes'), info).metas;
+  return handoffs
+    .map((item) => ({ id: item.id, at: item.created_at ?? '', title: item.title ?? path.basename(item.path, '.md') }))
     .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0))
     .slice(0, limit);
 }
@@ -454,6 +424,11 @@ export interface BriefInput {
 /** 只读开工摘要：锁内短读 live/claims，catalog 已在锁外读好。 */
 export async function brief(info: RepoInfo, input: BriefInput): Promise<string> {
   const catalog = input.catalog;
+  const localSpecs = listLocalSpecs(info).specs;
+  const specs = new Map(localSpecs.map((spec) => [spec.id, spec] as const));
+  for (const [id, spec] of catalog.specs) specs.set(id, spec);
+  const repoHandoffs = readRepositoryHandoffs(info);
+  const recent = recentHandoffs(info);
   const state = stateRoot(info);
   return withLock(
     state,
@@ -477,13 +452,20 @@ export async function brief(info: RepoInfo, input: BriefInput): Promise<string> 
       if (mine === undefined) {
         lines.push('本 lane 当前没有任务。用 cowork next 领取一个 ready 任务。');
       } else {
-        const spec = catalog.specs.get(mine.id) ?? listLocalSpecs(info).specs.find((item) => item.id === mine.id);
-        lines.push(`本 lane 任务: ${mine.id} ${spec?.title ?? '(spec 不在 trunk)'}（${mine.status}）`);
+        const spec = specs.get(mine.id);
+        const statusLabel = mine.status === 'reported_done' ? 'reported_done / 未验证' : mine.status;
+        lines.push(`本 lane 任务: ${mine.id} ${spec?.title ?? '(spec 不在 trunk)'}（${statusLabel}）`);
         if (spec !== undefined) {
           lines.push(`  touches: ${spec.touches.join(', ') || '(空)'}`);
           lines.push(`  reads: ${spec.reads.join(', ') || '(空)'}`);
           lines.push(`  done_when: ${spec.done_when.join('; ') || '(空)'}`);
           lines.push(`  spec_commit: ${mine.spec_commit ?? '(无)'}`);
+          if (mine.verification !== null) {
+            const latest = mine.verification.records.at(-1);
+            lines.push(`  verification: ${mine.verification.status}（config_commit ${mine.verification.config_commit}）`);
+            if (latest !== undefined) lines.push(`  最近检查: ${latest.name} exit=${String(latest.exit)} duration=${latest.duration_ms}ms`);
+            if (mine.verification.summary !== '') lines.push(`  摘要: ${mine.verification.summary}`);
+          }
           lines.push('依赖:');
           if (spec.depends_on.length === 0) lines.push('  (无)');
           for (const dep of spec.depends_on) {
@@ -515,27 +497,20 @@ export async function brief(info: RepoInfo, input: BriefInput): Promise<string> 
         lines.push(`  ${record.display}  lane=${record.lane ?? '(main)'} agent=${record.agentId}`);
       }
       lines.push('');
-      lines.push('契约提醒（本任务 reads 与其他活跃任务 touches 的交集）:');
-      const alerts: string[] = [];
-      for (const spec of catalog.specs.values()) {
+      lines.push('契约提醒（本 lane 相关）:');
+      const contractTasks: ContractTask[] = [...specs.values()].map((spec) => {
         const live = lives.get(spec.id);
-        if (live === undefined || live.status === 'merged' || live.status === 'cancelled') continue;
-        if (spec.id === mine?.id) continue;
-        for (const read of mine === undefined ? [] : (catalog.specs.get(mine.id)?.reads ?? [])) {
-          const readPath = parseClaim(read, info);
-          for (const touch of spec.touches) {
-            if (conflicts(readPath, parseClaim(touch, info))) {
-              alerts.push(`  ${read}（读）↔ ${spec.id} ${touch}（写）`);
-            }
-          }
-        }
-      }
-      lines.push(alerts.length === 0 ? '  (无)' : alerts.join('\n'));
+        return { id: spec.id, status: live?.status ?? 'draft', reads: spec.reads, touches: spec.touches, assigned_lane: live?.lane ?? null };
+      });
+      const alerts = buildContractAlerts(info, contractTasks, repoHandoffs).filter((alert) => alert.task === mine?.id || alert.peer_task === mine?.id);
+      lines.push(alerts.length === 0 ? '  (无)' : alerts.map((alert) => {
+        const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
+        return `  ${alert.kind}: ${alert.path} ← ${source || alert.summary}${source ? `（${alert.summary}）` : ''}`;
+      }).join('\n'));
       lines.push('');
-      const handoffs = recentHandoffs(info);
       lines.push('最近交接单:');
-      if (handoffs.length === 0) lines.push('  (无)');
-      for (const handoff of handoffs) {
+      if (recent.length === 0) lines.push('  (无)');
+      for (const handoff of recent) {
         lines.push(`  ${handoff.id}  ${handoff.at}  ${handoff.title}`);
       }
       lines.push('');

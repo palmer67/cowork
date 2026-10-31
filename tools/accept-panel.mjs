@@ -219,7 +219,10 @@ try {
     success(testResult); assert.match(testResult.stdout, /# fail 0/);
     const tsc = run(process.execPath, [path.join(project, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit'], project);
     success(tsc); assert.equal(tsc.stdout + tsc.stderr, '');
-    const architecture = run('git', ['-C', project, 'diff', 'main', '--', 'docs/ARCHITECTURE-TASKS.md', 'docs/ARCHITECTURE.md', 'test/ui.test.ts'], project);
+    // 判基线：本地 main 优先（CI 的单分支 checkout 没有它），退到 origin/main
+    const baseRef = ['main', 'origin/main'].find((ref) => run('git', ['-C', project, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], project).code === 0);
+    assert.ok(baseRef, '找不到 main 分支（本地或 origin/main）');
+    const architecture = run('git', ['-C', project, 'diff', baseRef, '--', 'docs/ARCHITECTURE-TASKS.md', 'docs/ARCHITECTURE.md', 'test/ui.test.ts'], project);
     success(architecture); assert.equal(architecture.stdout, '');
     const source = readFileSync(path.join(project, 'src', 'uiserver.ts'), 'utf8'); assert.doesNotMatch(source, /writeFileSync|renameSync/);
     for (const name of readdirSync(path.join(project, 'src')).filter((s) => s.endsWith('.ts'))) assert.ok(!readFileSync(path.join(project, 'src', name), 'utf8').includes('0.0.0.0'));

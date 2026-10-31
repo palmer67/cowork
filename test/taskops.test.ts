@@ -518,3 +518,33 @@ test('confirm-merge 只释放本任务的占位，不误删已接管的 claim', 
     fixture.cleanup();
   }
 });
+test('M2 状态可阻塞后继续，或重新就绪并释放占位', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    await next(fixture.info, { agent: 'alice', lane: 'alpha', lanePath: fixture.info.laneTop });
+    await startTask(fixture.info, 't-00a1b2', 'alice');
+    await reportDone(fixture.info, 't-00a1b2', 'alice');
+    markAwaitingMerge(fixture, 't-00a1b2', 'alice');
+
+    const blocked = await blockTask(fixture.info, 't-00a1b2', 'alice', '等待依赖确认');
+    assert.equal(blocked.status, 'blocked');
+    assert.equal(blocked.blocked_reason, '等待依赖确认');
+    assert.equal(listClaims(fixture.state).length, 1);
+    const continued = await startTask(fixture.info, 't-00a1b2', 'alice');
+    assert.equal(continued.status, 'in_progress');
+    assert.equal(continued.blocked_reason, null);
+    assert.equal(listClaims(fixture.state).length, 1);
+
+    await reportDone(fixture.info, 't-00a1b2', 'alice');
+    markAwaitingMerge(fixture, 't-00a1b2', 'alice');
+    await blockTask(fixture.info, 't-00a1b2', 'alice', '重新排队');
+    const readied = await readyTask(fixture.info, 't-00a1b2');
+    assert.equal(readied.status, 'ready');
+    assert.equal(readied.lane, null);
+    assert.equal(readied.agent, null);
+    assert.equal(listClaims(fixture.state).length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});

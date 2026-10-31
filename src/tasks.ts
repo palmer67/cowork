@@ -17,6 +17,9 @@ export type TaskStatus =
   | 'claimed'
   | 'in_progress'
   | 'reported_done'
+  | 'verifying'
+  | 'verify_failed'
+  | 'awaiting_merge'
   | 'merged'
   | 'blocked'
   | 'cancelled';
@@ -27,12 +30,15 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
   'claimed',
   'in_progress',
   'reported_done',
+  'verifying',
+  'verify_failed',
+  'awaiting_merge',
   'merged',
   'blocked',
   'cancelled',
 ];
 
-/** M2 的自动验证态；M1 出现即拒绝。 */
+/** M1 的公开转换 API 不开放 M2 自动验证态。 */
 export const M2_STATUSES: readonly string[] = ['verifying', 'verify_failed', 'awaiting_merge'];
 
 const TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
@@ -41,7 +47,10 @@ const TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   claimed: ['in_progress', 'blocked', 'cancelled'],
   in_progress: ['reported_done', 'blocked', 'cancelled'],
   reported_done: ['merged', 'cancelled'],
-  blocked: ['in_progress', 'cancelled'],
+  verifying: [],
+  verify_failed: [],
+  awaiting_merge: [],
+  blocked: ['ready', 'in_progress', 'cancelled'],
   // "任意 → cancelled" 按字面执行：已合并的任务也能被取消（留痕在 history）。
   merged: ['cancelled'],
   cancelled: [],

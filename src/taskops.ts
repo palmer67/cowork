@@ -43,6 +43,7 @@ export interface TaskView {
   updated_at: string | null;
   blocked_reason: string | null;
   spec_path: string | null;
+  verification: TaskLive['verification'];
 }
 
 export interface TaskListView {
@@ -65,6 +66,7 @@ function toView(spec: TaskSpec, live: TaskLive | null): TaskView {
     updated_at: live?.updated_at ?? null,
     blocked_reason: live?.blocked_reason ?? null,
     spec_path: spec.path,
+    verification: live?.verification ?? null,
   };
 }
 
@@ -189,17 +191,24 @@ export async function readyTask(info: RepoInfo, id: string): Promise<TaskLive> {
   requireSpecInTrunk(catalog, id);
   return withTaskLock(info, (state) => {
     const live = readTaskLive(state, id);
-    if (live !== null && live.status !== 'draft') {
+    if (live !== null && live.status !== 'draft' && live.status !== 'blocked') {
       throw general(
         `任务当前状态不能 ready: ${id} → ${live.status}`,
-        '只有 draft 可以进入 ready；ready 之后 spec 不可改写，要改请 cancel 后重建。',
+        '只有 draft 或 blocked 可以进入 ready；ready 之后 spec 不可改写，要改请 cancel 后重建。',
       );
     }
-    return transitionTask(state, id, 'ready', {
+    if (live?.status === 'blocked' && live.verification?.status === 'running') {
+      throw general(`任务 ${id} 的验证仍在运行，暂不能重新就绪`, '等待 task done 记录验证结果，或运行 doctor --fix 确认进程已退出。');
+    }
+    const ready = transitionTask(state, id, 'ready', {
       specCommit: catalog.rev,
       agent: null,
+      lane: null,
+      lanePath: null,
       note: `ready @${catalog.trunk}@${catalog.rev.slice(0, 7)}`,
     });
+    if (live?.status === 'blocked') releaseTaskClaims(info, state, requireSpecInTrunk(catalog, id));
+    return ready;
   });
 }
 
@@ -223,14 +232,17 @@ function requireLive(state: string, id: string): TaskLive {
 export async function startTask(info: RepoInfo, id: string, agent: string): Promise<TaskLive> {
   return withTaskLock(info, (state) => {
     const live = requireLive(state, id);
-    if (live.status !== 'claimed') {
+    if (live.status !== 'claimed' && live.status !== 'blocked') {
       throw general(
         `任务当前状态不能 start: ${id} → ${live.status}`,
-        'start 只适用于 claimed；先 cowork next 领取，或用 cowork task show 查看状态。',
+        'start 适用于 claimed 或 blocked；先 cowork next 领取，或用 cowork task show 查看状态。',
       );
     }
+    if (live.status === 'blocked' && live.verification?.status === 'running') {
+      throw general(`任务 ${id} 的验证仍在运行，暂不能解除阻塞`, '等待 task done 记录验证结果，或运行 doctor --fix 确认进程已退出。');
+    }
     requireOwner(live, agent, 'start');
-    return transitionTask(state, id, 'in_progress', { agent, note: 'start' });
+    return transitionTask(state, id, 'in_progress', { agent, note: live.status === 'blocked' ? 'unblock/start' : 'start' });
   });
 }
 
@@ -255,6 +267,9 @@ export async function blockTask(info: RepoInfo, id: string, agent: string, reaso
   return withTaskLock(info, (state) => {
     const live = requireLive(state, id);
     requireOwner(live, agent, 'block');
+    if (['reported_done', 'verifying', 'verify_failed', 'awaiting_merge'].includes(live.status)) {
+      return transitionM2Task(state, id, 'blocked', { agent, reason, note: `blocked: ${reason}` });
+    }
     return transitionTask(state, id, 'blocked', { agent, reason, note: `blocked: ${reason}` });
   });
 }

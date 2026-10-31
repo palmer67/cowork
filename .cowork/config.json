@@ -1,4 +1,28 @@
 {
   "schemaVersion": 1,
-  "trunk": "main"
+  "trunk": "main",
+  "verification": {
+    "allow_disabled": false,
+    "commands": [
+      {
+        "name": "test",
+        "argv": ["node", "--experimental-strip-types", "--test", "--test-concurrency=1", "test/*.test.ts"],
+        "timeout_ms": 300000,
+        "enabled": true
+      },
+      {
+        "name": "types",
+        "argv": ["node", "node_modules/typescript/bin/tsc", "--noEmit"],
+        "timeout_ms": 120000,
+        "enabled": true
+      },
+      {
+        "name": "build",
+        "argv": ["node", "node_modules/typescript/bin/tsc", "-p", "tsconfig.json"],
+        "timeout_ms": 120000,
+        "enabled": true
+      }
+    ],
+    "env_allowlist": ["PATH", "SystemRoot", "ComSpec", "TEMP", "TMP", "CI", "NODE_ENV", "COWORK_AGENT_ID"]
+  }
 }

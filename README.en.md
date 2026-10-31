@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
-  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -240,7 +240,7 @@ The code is plain Node with no native dependencies, but the concurrency primitiv
 ## Contributing
 
 ```bash
-npm test                              # 132 tests: node:test against real git worktrees
+npm test                              # 133 tests: node:test against real git worktrees
 npx tsc --noEmit                      # type check
 npm run build                         # compile to dist/
 node tools/mutex-gate.mjs             # concurrency gate: 8 processes x 1000 runs, zero overlap

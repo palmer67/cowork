@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
-  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -238,7 +238,7 @@ cowork version
 ## 参与开发
 
 ```bash
-npm test                              # 132 个测试：node:test + 真实 git worktree
+npm test                              # 133 个测试：node:test + 真实 git worktree
 npx tsc --noEmit                      # 类型检查
 npm run build                         # 编译到 dist/
 node tools/mutex-gate.mjs             # 并发门槛：8 进程 × 1000 次，不许有一次重叠

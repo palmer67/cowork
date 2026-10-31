@@ -16,7 +16,7 @@ reported_done --task done--> verifying --全部验证通过--> awaiting_merge --
                                       +--任一失败/超时/dirty/HEAD 漂移--> verify_failed
 
 verify_failed --owner 修复后 task done--> verifying
-verifying --doctor --fix（确认验证进程已死）--> reported_done
+verifying --doctor --fix（确认原验证进程已退出）--> reported_done
 ```
 
 `reported_done -> verifying` 在 `task done` 的第一次短锁临界区内完成，命令随后在锁外运行验证。启动失败、配置错误、owner/claim 不匹配为一般错误，退出 `1`，状态保持 `reported_done`；不把未执行伪装成验证失败。
@@ -30,6 +30,8 @@ verifying --doctor --fix（确认验证进程已死）--> reported_done
 | 请求或结果 | 状态变化 | 退出码 |
 | --- | --- | --- |
 | owner 的 `task done`: reported_done → verifying，随后全部通过 | awaiting_merge | `0` |
+| `task done` 命中 `in_progress`、`merged` 或 `cancelled` | 状态不变；说明当前状态及允许的后续操作 | `1` |
+| `task done` 在 `verifying` 中重复调用 | 状态不变；提示正在验证中，不新增 verification 记录 | `2` |
 | 初始 dirty、配置无效或 executable 启动失败 | 保持 reported_done | `1` |
 | owner/lease 冲突或第二次锁发现 run_id/status 已被替换 | 保持当前状态 | `2` |
 | 任一验证失败、超时、验证中 dirty 或 HEAD 漂移 | verify_failed | `1` |
@@ -39,9 +41,9 @@ verifying --doctor --fix（确认验证进程已死）--> reported_done
 | 实际 Git merge 冲突 | awaiting_merge 不变 | `2` |
 | git-common-dir 或 lane 环境不可用 | 状态不变 | `3` |
 
-所有未列出的状态转移统一拒绝，退出 `1`；owner/并发版本冲突属于 `2`，环境缺失属于 `3`。任何拒绝均不得局部写入状态或释放 claim。
+除表中明确的并发冲突外，未允许的状态转移统一拒绝，退出 `1` 并说明当前状态和允许的做法；owner/并发版本冲突属于 `2`，环境缺失属于 `3`。任何拒绝均不得局部写入状态或释放 claim。
 
-验证进程崩溃时由 `doctor --fix` 负责恢复：live 记录保存 `verification.pid`、`verification.host`、`started_at` 和 `run_id`；仅当 host 是本机且 PID 已确认不存在时，doctor 才把 `verifying` 推回 `reported_done`，保留 owner、lease、claims 和历史并输出恢复记录。PID 仍存活、host 不同、字段损坏或无法确认时不自动回退，doctor 只报提示，避免误杀仍在运行的验证。普通 `doctor` 不改变状态。
+验证进程崩溃时唯一恢复入口是 `doctor --fix`：live 记录保存 `verification.pid`、`verification.host`、`verification.pid_started_at`、`started_at` 和 `run_id`。仅当 host 是本机，且 PID 当前不存在，或 PID 虽存在但其进程启动时间与 `pid_started_at` 明确不同（确认已被复用）时，doctor 才把 `verifying` 推回 `reported_done`；若启动时间匹配，则原验证进程仍活着，不恢复。无法取得或比对启动时间、host 不同、字段损坏或其他情况无法确认时，不自动改状态，只输出提示。恢复时保留 owner、lease、claims 和历史，并在 live 的 `recovery` 字段记录恢复时间、原 `run_id` 和判定依据。普通 `doctor` 不改变状态。
 
 被否决的备选：
 
@@ -50,7 +52,7 @@ verifying --doctor --fix（确认验证进程已死）--> reported_done
 
 ### 2. 验证配置
 
-选择 `.cowork/config.json` 增加 `verification` 对象，命令是参数数组：
+选择 `.cowork/config.json` 增加 `verification` 对象，命令是参数数组。每次验证都必须从 trunk 提交读取配置：先确定 trunk ref 对应的 commit SHA，再执行等价于 `git show <trunk>:.cowork/config.json` 的读取；验证命令、超时和 `env_allowlist` 均只使用该提交中的内容，不读取任何工作树版本（包括 assigned lane 的已提交、暂存或未提交版本）。将该 SHA 写入本次 `verification.config_commit`，并在面板与 `brief` 中展示，保证验证配置可追溯。配置中 `verification` 以外的顶层键允许存在；`verification` 缺失、形状错误或字段非法时，退出 `1` 并给出可读说明，不启动验证。
 
 ```json
 {
@@ -67,7 +69,7 @@ verifying --doctor --fix（确认验证进程已死）--> reported_done
 }
 ```
 
-schema 规则：`commands` 非空数组；每项 `name` 唯一且为短标识，`argv` 非空字符串数组，第一项是可执行文件，`timeout_ms` 为 1..3,600,000 的整数，`enabled` 为布尔值。`allow_disabled=false` 时所有项必须 enabled；只有显式设为 true 才允许禁用单项，禁用项写入 verification 记录并显示为 skipped，不能悄悄消失。至少保留一项 enabled 命令。
+schema 规则：`commands` 非空数组；每项 `name` 唯一且为短标识，`argv` 非空字符串数组，第一项是可执行文件，`timeout_ms` 为 1..3,600,000 的整数，`enabled` 为布尔值。`allow_disabled=false` 时所有项必须 enabled；只有显式设为 `true` 才允许禁用单项，禁用项写入 verification 记录并显示为 skipped，不能悄悄消失。至少保留一项 enabled 命令。
 
 执行使用 `execFile(argv[0], argv.slice(1), { cwd, shell: false })`，不拼接 shell 字符串，也不从配置读取 shell。配置中的 executable 必须是可直接执行的程序；Windows 的 `.cmd`/`.bat` 包装器不允许作为 argv[0]，示例通过 `node.exe` 直接运行 Node 测试 runner 与 TypeScript 编译器入口，避免平台 shell 差异。`cwd` 固定为任务 `assigned_lane` 对应的 worktree 根；lane 缺失、worktree 不存在或不等于 lease 记录的路径时拒绝执行。环境只继承内置白名单中的现值和当前任务所需的 `COWORK_AGENT_ID`，不继承完整 `process.env`，配置不能扩展白名单或注入 secret。
 
@@ -103,13 +105,15 @@ dirty 判定使用 `git status --porcelain=v1 -z --untracked-files=all`；暂存
   "status": "running|passed|failed|stale",
   "pid": 1234,
   "host": "HOST",
+  "pid_started_at": "2026-11-01T09:59:59.000Z",
   "started_at": "2026-11-01T10:00:00.000Z",
   "finished_at": null,
   "head_before": "<sha>",
   "head_after": null,
+  "config_commit": "<trunk-sha>",
   "summary": "",
   "records": [
-    { "name": "test", "argv": ["node", "--experimental-strip-types", "--test"], "exit": 0, "duration_ms": 1200, "head": "<sha>", "summary": "132 pass", "at": "..." }
+    { "name": "test", "argv": ["node", "--experimental-strip-types", "--test"], "exit": 0, "timed_out": false, "duration_ms": 1200, "head": "<sha>", "summary": "132 pass", "at": "..." }
   ]
 }
 ```
@@ -130,7 +134,7 @@ dirty 判定使用 `git status --porcelain=v1 -z --untracked-files=all`；暂存
 
 ### 6. `contracts_alerts`
 
-选择把 handoff front matter 的 `contracts_changed` 定义为对象数组，每个对象至少有一个 `paths` 数组，其他字段用于展示：
+裁定采纳 A：把 handoff front matter 的 `contracts_changed` 定义为对象数组，每个对象只对 `paths` 做强校验，其他字段用于展示：
 
 ```yaml
 contracts_changed:
@@ -176,9 +180,9 @@ contracts_changed:
 
 ## 数据与配置 schema
 
-配置顶层为 `verification`：`allow_disabled: boolean`、非空 `commands: VerificationCommand[]`、固定的 `env_allowlist: string[]`。每个命令包含唯一 `name`、非空 `argv: string[]`、有界 `timeout_ms` 和 `enabled: boolean`；至少一个命令启用。执行记录包含命令名、原始 argv、exit、duration、head、摘要与时间。
+验证配置必须取自 trunk commit 的 `.cowork/config.json`；任何 lane 工作树版本均不参与验证配置读取。配置允许其他顶层键，但 `verification` 缺失或形状错误时退出 `1`。配置对象含 `allow_disabled: boolean`、非空 `commands: VerificationCommand[]`、固定的 `env_allowlist: string[]`。每个命令包含唯一 `name`、非空 `argv: string[]`、有界 `timeout_ms` 和 `enabled: boolean`；至少一个命令启用。执行记录包含命令名、原始 argv、exit、`timed_out`、duration、head、摘要与时间；verification 记录包含 `config_commit`。
 
-task live 的可空 `verification` 记录含 `run_id`、`status`、`pid`、`host`、`started_at`、`finished_at`、`head_before`、`head_after`、summary 和 records；snapshot 对任务投影同一字段，不重算或丢弃历史。`head_before` 即本次验证绑定的 `verify_head`。
+task live 的可空 `verification` 记录含 `run_id`、`status`、`pid`、`host`、`pid_started_at`、`started_at`、`finished_at`、`head_before`、`head_after`、`config_commit`、summary 和 records；snapshot 对任务投影同一字段，不重算或丢弃历史。`head_before` 即本次验证绑定的 `verify_head`。live 的 `recovery` 字段记录 doctor 的恢复时间、原 `run_id` 和判定依据。
 
 handoff `contracts_changed` 是对象数组，每项的 `paths` 是非空字符串数组；old/new/compatibility/affected_tasks 为可选展示字段。缺字段默认为空列表，坏形状进入 handoff diagnostics。snapshot `contract_alerts` 每项含 kind、读方/写方 task 或 lane、path、handoff path 与 summary。
 
@@ -196,7 +200,7 @@ draft -> ready -> claimed -> in_progress -> reported_done
                               |                       v
                               +--------------------> merged
 
-doctor --fix: verifying --(本机 PID 已死)--> reported_done
+doctor --fix: verifying --(本机原 PID 不存在，或已确认 PID 被复用)--> reported_done
 blocked 可从 ready/claimed/in_progress/reported_done/verifying/verify_failed/awaiting_merge 进入；
 blocked -> ready 或 in_progress；ready/blocked -> cancelled。
 ```
@@ -205,8 +209,8 @@ blocked -> ready 或 in_progress；ready/blocked -> cancelled。
 
 ```text
 task done
-  ├─ lock #1: owner/lease/claim/spec/dirty/head 校验
-  ├─ lock #1: 写 verifying(run_id, pid, head_before, started_at)
+  ├─ lock #1: 从 trunk commit 加载配置，并校验 owner/lease/claim/spec/dirty/head
+  ├─ lock #1: 写 verifying(run_id, pid, pid_started_at, head_before, started_at, config_commit)
   ├─ unlock
   ├─ execFile 命令 1..N（固定 cwd、argv、超时、白名单环境）
   ├─ lock #2: 校验 run_id/status/owner/claims/head/dirty
@@ -214,9 +218,9 @@ task done
   └─ unlock，返回 1 或 0
 
 doctor --fix
-  ├─ lock: 读取 verifying 的 pid/host/run_id
-  ├─ 确认本机 PID 已死
-  ├─ lock: verifying -> reported_done，保留 lease/claims，追加 recovery history
+  ├─ lock: 读取 verifying 的 pid/host/pid_started_at/run_id
+  ├─ 核验 PID 启动时间，排除 PID 复用；无法核验时只提示
+  ├─ lock: 确认原进程已退出后 verifying -> reported_done，保留 lease/claims，写 live.recovery
   └─ unlock
 ```
 
@@ -231,16 +235,17 @@ doctor --fix
 5. squash 场景不带 `--manual` 或缺 `--reason` 的 `confirm-merge` 退出 `1`，状态仍为 awaiting_merge。
 6. `reads` 与其他任务 touches 相交时，`brief`、`next` 和 snapshot 各出现一条结构化契约提醒。
 7. 修正/移除冲突 handoff 后重新生成 snapshot，原契约提醒消失，坏 front matter 则进入 diagnostics。
-8. 验证进程被杀死且 live PID 已失效时，`doctor --fix` 把 verifying 恢复为 reported_done，保留 claim，并记录恢复历史；PID 仍存活时不回退。
+8. 验证进程被杀死后，`doctor --fix` 确认原 PID 不存在或已被复用时，把 verifying 恢复为 reported_done，保留 claim，并在 live `recovery` 记录时间、原 run_id 和依据；PID 启动时间匹配原记录时不回退，启动时间无法比对时只提示。
 9. snapshot 在 verifying/verify_failed/awaiting_merge 分别显示 verification status、命令记录、exit、duration、head 和 summary。
 10. 普通 merge 的 target 不存在或不满足 `is-ancestor` 时退出 `1`、状态和 claims 不变；满足时才 merged 并释放占位。
 11. rename、delete 和 `src/foo/**` 的契约/reads 命中与 touches matcher 一致，路径段相邻前缀不误报。
 12. 验证命令写入 worktree 后未自清理，结果为 verify_failed；写入系统临时目录且工作树保持 clean 时可进入 awaiting_merge。
+13. trunk 配置把命令超时设为 `1000ms`，验证命令运行约 3 秒：对应 record 的 `timed_out=true`，`task done` 退出 `1`，状态为 `verify_failed` 且 claims 保留。
+14. 一个 lane 的验证持续 5 秒期间，另一个 lane 的 `cowork next` 和创建唯一新 lane 的 `cowork lane new` 均须在 2 秒内返回；验证执行期间不持有阻塞全局命令的 mutex。
+15. task 处于 `verifying` 时重复执行 `task done`，退出 `2`、提示正在验证中，状态不变且不产生第二条 verification 记录。
+16. 面板可见 `verifying`、`awaiting_merge`、`verify_failed` 三态；失败态提供一键复制 `cowork task done <id>` 的“重跑验证”命令。
+17. 在 lane 中提交一个将验证命令改为必然通过的 `.cowork/config.json`，执行 `task done` 仍按 trunk 提交配置验证；记录的 `config_commit` 等于该 trunk commit SHA。
 
-## 需要判官裁定的问题
+## 已裁定问题
 
-1. 验证进程崩溃恢复：A. 仅 `doctor --fix` 在 PID 明确死亡时恢复（我的倾向）；B. 允许下一次 owner 的 `task done` 同时恢复。取舍：A 更保守，B 少一个人工维护动作但更容易误判。
-2. 禁用验证项：A. 配置显式 `allow_disabled=true` 才能禁用并记录 skipped（我的倾向）；B. 永远不允许禁用。取舍：A 支持仓库阶段性缺少工具，B 更强保证但难以迁移。
-3. 验证副作用：A. 命令必须自清理/写系统临时目录，dirty 就失败（我的倾向）；B. CLI 维护允许输出路径并在成功后自动还原。取舍：A 保持 CLI 不成为清理器，B 更方便但会隐藏命令副作用。
-4. `contracts_changed` 的旧/新字段：A. 保持自由文本并只强校验 `paths`（我的倾向）；B. 再定义结构化 schema（例如每项 name/type/breaking）。取舍：A 兼容现有 handoff，B 便于机器展示但扩大 M2 schema。
-5. 普通 merge 的 target 输入：A. 沿用现有 `--commit`，把它解释为目标 commit（我的倾向）；B. 新增 `--target` 并保留 `--commit` 表示 lane 验证 HEAD。取舍：A 改动面小，B 语义更直白但需要兼容两个参数和旧脚本。
+本轮五个待裁定问题全部采纳 A：恢复仅由 `doctor --fix` 执行；禁用验证项必须显式设置 `allow_disabled=true` 并记为 skipped；验证命令造成 dirty 即失败且 CLI 不清理；`contracts_changed` 只强校验 `paths`；`confirm-merge` 沿用 `--commit` 表示目标 commit。

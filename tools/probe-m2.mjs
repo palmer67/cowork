@@ -287,6 +287,13 @@ try {
       const snap = run(['snapshot', '--json'], root, true).stdout;
       const alerts = JSON.parse(snap)?.contract_alerts ?? [];
       check('P9 snapshot 出现结构化契约提醒', alerts.some((x) => x.kind && x.path === 'src/api.ts'), JSON.stringify(alerts).slice(0, 200));
+      // 清空 ready 队列，避免后续 next 领到 P9 留下的任务
+      for (const wanted of [aid, bid]) {
+        const claimed = claimNext(okLane);
+        const target = claimed === wanted ? wanted : claimed;
+        const c = run(['task', 'cancel', target], okLane, true);
+        if (c.code !== 0) throw new Error(`P9 清理 ${target} 失败: ${c.stdout}${c.stderr}`);
+      }
     }
   }
 
@@ -305,6 +312,94 @@ try {
     check('P10 doctor --fix 恢复为 reported_done', after?.status === 'reported_done', `实际 ${after?.status} ${r.stdout}${r.stderr}`);
     check('P10 恢复保留 claim', Array.isArray(after?.claims) && after.claims.length > 0, JSON.stringify(after?.claims));
   }
+
+  // P11 只有 reported_done 能 done：claimed 状态必须被拒
+  {
+    const id = addReady('P11 非法转移', ['src/p11.ts']);
+    claimNext(okLane);
+    const r = run(['task', 'done', id], okLane, true);
+    const live = readLive(id);
+    check('P11 claimed 下 task done 退出 1', r.code === 1, `实际 ${r.code}`);
+    check('P11 状态未推进到 verifying', live?.status === 'claimed', `实际 ${live?.status}`);
+  }
+
+  // P12 reported_done 不能直接合并（R7）
+  {
+    const { id, laneDir } = reportedDoneTask('P12 未验证合并', ['src/p12.ts'], 'probe-m2');
+    const head = git(['rev-parse', 'HEAD'], laneDir);
+    const m = run(['confirm-merge', id, '--commit', head, '--manual', '--reason', 'probe'], root, true);
+    check('P12 reported_done 直接合并退出 1', m.code === 1, `实际 ${m.code} ${(m.stdout + m.stderr).trim().slice(0, 120)}`);
+    check('P12 状态仍 reported_done', readLive(id)?.status === 'reported_done', `实际 ${readLive(id)?.status}`);
+    check('P12 拒绝文案说明需要先验证', /尚未验证|verify|task done/.test(m.stdout + m.stderr), (m.stdout + m.stderr).trim().slice(0, 160));
+  }
+
+  // P13 可执行文件不存在：回到 reported_done，不残留 verifying（R8）
+  {
+    writeConfig(root, [{ name: 'missing', argv: [path.join(root, 'tools', 'no-such-exe.exe')], timeout_ms: 60000 }]);
+    const { id, laneDir } = reportedDoneTask('P13 启动失败', ['src/p13.ts'], 'probe-m2');
+    const r = run(['task', 'done', id], laneDir, true);
+    const live = readLive(id);
+    const rec = (live?.verification?.records ?? [])[0];
+    check('P13 spawn 失败退出 1', r.code === 1, `实际 ${r.code}`);
+    check('P13 状态回到 reported_done', live?.status === 'reported_done', `实际 ${live?.status}`);
+    check('P13 verification.status=failed', live?.verification?.status === 'failed', JSON.stringify(live?.verification ?? {}).slice(0, 120));
+    check('P13 record 记录 exit=null 与 error=spawn', rec?.exit === null && rec?.error === 'spawn', JSON.stringify(rec));
+  }
+
+  // P14 验证命令写脏工作树
+  {
+    writeConfig(root, [{ name: 'dirty', argv: nodeArgv('v-dirty.js'), timeout_ms: 60000 }]);
+    const { id, laneDir } = reportedDoneTask('P14 验证中脏', ['src/p14.ts'], 'probe-m2');
+    const r = run(['task', 'done', id], laneDir, true);
+    check('P14 验证写脏退出 1', r.code === 1, `实际 ${r.code}`);
+    check('P14 状态 verify_failed', readLive(id)?.status === 'verify_failed', `实际 ${readLive(id)?.status}`);
+    rmSync(path.join(laneDir, 'probe-side-effect.txt'), { force: true });
+  }
+
+  // P15 未跟踪文件也算 dirty，验证前拒绝
+  {
+    const { id, laneDir } = reportedDoneTask('P15 未跟踪脏', ['src/p15.ts'], 'probe-m2');
+    writeFileSync(path.join(laneDir, 'probe-untracked.txt'), 'x\n');
+    const r = run(['task', 'done', id], laneDir, true);
+    check('P15 未跟踪文件被当 dirty，退出 1', r.code === 1, `实际 ${r.code}`);
+    check('P15 状态保持 reported_done', readLive(id)?.status === 'reported_done', `实际 ${readLive(id)?.status}`);
+    rmSync(path.join(laneDir, 'probe-untracked.txt'), { force: true });
+  }
+
+  // P16 snapshot 投影验证中状态与字段
+  {
+    writeConfig(root, [{ name: 'slow', argv: nodeArgv('v-slow-pass.js'), timeout_ms: 60000 }]);
+    const { id, laneDir } = reportedDoneTask('P16 快照投影', ['src/p16.ts'], 'probe-m2');
+    const child = spawn(process.execPath, [cli, 'task', 'done', id], { cwd: laneDir, windowsHide: true });
+    await sleep(700);
+    const snap = JSON.parse(run(['snapshot', '--json'], root, true).stdout || '{}');
+    const t = (snap.tasks ?? []).find((x) => x.id === id);
+    check('P16 快照状态为 verifying', t?.status === 'verifying', `实际 ${t?.status}`);
+    check('P16 快照投影 verification.run_id', typeof t?.verification?.run_id === 'string', JSON.stringify(t?.verification ?? {}).slice(0, 140));
+    await exitCode(child);
+  }
+
+  // P17 摘要上限 2 KiB
+  {
+    writeFileSync(path.join(root, 'tools', 'v-noisy.js'), "process.stdout.write('x'.repeat(5000)); process.exit(0);\n");
+    writeConfig(root, [{ name: 'noisy', argv: nodeArgv('v-noisy.js'), timeout_ms: 60000 }]);
+    const { id, laneDir } = reportedDoneTask('P17 摘要截断', ['src/p17.ts'], 'probe-m2');
+    const r = run(['task', 'done', id], laneDir, true);
+    const live = readLive(id);
+    const s = (live?.verification?.records ?? [])[0]?.summary ?? '';
+    check('P17 大输出下验证仍成功', r.code === 0, `实际 ${r.code} ${(r.stdout + r.stderr).trim().slice(0, 100)}`);
+    check('P17 summary 不超过 2 KiB', s.length > 0 && s.length <= 2048, `长度 ${s.length}`);
+  }
+
+  // P18 面板展示三态与重跑命令
+  {
+    run(['ui', '--out', 'probe-panel.html'], root, true);
+    const htmlPath = path.join(root, 'probe-panel.html');
+    const html = existsSync(htmlPath) ? readFileSync(htmlPath, 'utf8') : '';
+    check('P18 面板含 verify_failed 状态', html.includes('verify_failed'), `长度 ${html.length}`);
+    check('P18 面板含 awaiting_merge 状态', html.includes('awaiting_merge'));
+    check('P18 面板提供可复制的重跑命令', /cowork task done t-[0-9a-f]{6}/.test(html));
+  }
 } catch (err) {
   failures += 1;
   console.error(`\n探针自身异常: ${err instanceof Error ? err.message : String(err)}`);
@@ -316,4 +411,34 @@ process.exitCode = failures === 0 ? 0 : 1;
 function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
 function exitCode(child) {
   return new Promise((res) => { child.on('exit', (code) => res(code ?? 1)); });
+}
+
+/** 建任务 → 提交 spec → ready，返回 id（不领取） */
+function addReady(title, touches) {
+  const add = run(['task', 'add', '--title', title, '--touches', ...touches, '--done-when', 'probe'], root);
+  const id = idFrom(add.stdout);
+  git(['add', '.cowork/tasks'], root);
+  git(['commit', '-q', '-m', `task: ${id}`], root);
+  const r = run(['task', 'ready', id], root, true);
+  if (r.code !== 0) throw new Error(`task ready 失败: ${r.stdout}${r.stderr}`);
+  return id;
+}
+
+/** 在当前 ready 队列里领一个任务（FIFO） */
+function claimNext(laneDir) {
+  const n = run(['next'], laneDir, true);
+  if (n.code !== 0) throw new Error(`next 失败: ${n.stdout}${n.stderr}`);
+  return idFrom(n.stdout);
+}
+
+/** 领取 → start → report-done，返回 { id, laneDir } */
+function reportedDoneTask(title, touches, laneName) {
+  const id = addReady(title, touches);
+  const laneDir = path.join(root, '.cowork', 'lanes', laneName);
+  claimNext(laneDir);
+  const start = run(['task', 'start', id], laneDir, true);
+  if (start.code !== 0) throw new Error(`start 失败: ${start.stdout}${start.stderr}`);
+  const done = run(['task', 'report-done', id], laneDir, true);
+  if (done.code !== 0) throw new Error(`report-done 失败: ${done.stdout}${done.stderr}`);
+  return { id, laneDir };
 }

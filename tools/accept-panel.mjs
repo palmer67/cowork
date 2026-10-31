@@ -142,6 +142,19 @@ try {
     success(git(['add', '.cowork/tasks'])); success(git(['commit', '-qm', 'task: login']));
     success(await post(`/api/task/${id}/ready`)); success(await post('/api/lane/dsh/next'));
     assert.equal(live().status, 'claimed'); assert.equal(live().lane, 'dsh'); assert.equal(live().agent, 'dsh');
+    const panelSnapshot = JSON.parse((await http('/api/snapshot')).text);
+    assert.equal(panelSnapshot.panel_agent, 'panel-operator');
+    const assigned = panelSnapshot.tasks.find((task) => task.id === id);
+    assert.equal(assigned.assigned_lane, 'dsh'); assert.equal(assigned.agent, 'dsh');
+    const home = await http(`/?t=${token}`); assert.equal(home.status, 200);
+    const startNeedle = `data-api="/api/task/${id}/start"`;
+    const startAt = home.text.indexOf(startNeedle); assert.notEqual(startAt, -1, '已派工任务必须显示 start 动作');
+    const startBegin = home.text.lastIndexOf('<button', startAt);
+    const startEnd = home.text.indexOf('</button>', startAt) + '</button>'.length;
+    const startButton = home.text.slice(startBegin, startEnd);
+    assert.match(startButton, /disabled title="需在车道 dsh 内由 dsh 执行"/);
+    assert.match(home.text, new RegExp(`<code class="mono">cowork task start ${id}<\\/code>`));
+    assert.match(home.text, new RegExp(`data-copy="cowork task start ${id}"`));
     // M1 当前把 lease 写入 live task JSON；claims 是独立目录，leases 目录可能不存在。
     assert.ok(existsSync(path.join(state, 'tasks', `${id}.json`))); assert.ok(readdirSync(path.join(state, 'claims')).length > 0);
     const detail = success(JSON.parse((await http(`/api/tasks/${id}`)).text)); assert.match(detail.stdout, /claimed/);

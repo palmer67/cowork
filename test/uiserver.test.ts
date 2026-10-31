@@ -36,8 +36,19 @@ async function withPanel(fn: (panel: PanelServer) => Promise<void>, execute: Cli
   try { await fn(panel); } finally { await panel.close(); }
 }
 
+async function withAgent(agent: string | undefined, fn: () => Promise<void>): Promise<void> {
+  const previous = process.env.COWORK_AGENT_ID;
+  if (agent === undefined) delete process.env.COWORK_AGENT_ID;
+  else process.env.COWORK_AGENT_ID = agent;
+  try { await fn(); }
+  finally {
+    if (previous === undefined) delete process.env.COWORK_AGENT_ID;
+    else process.env.COWORK_AGENT_ID = previous;
+  }
+}
+
 test('首页和 API 无 token/错 token 均 401，正确 token 返回 HTML 与快照', async () => {
-  await withPanel(async (panel) => {
+  await withAgent(undefined, () => withPanel(async (panel) => {
     assert.equal((panel.server.address() as import('node:net').AddressInfo).address, '127.0.0.1');
     assert.equal((await http(panel, '/')).status, 401);
     assert.equal((await http(panel, '/?t=wrong')).status, 401);
@@ -47,8 +58,11 @@ test('首页和 API 无 token/错 token 均 401，正确 token 返回 HTML 与�
     assert.equal(home.status, 200);
     assert.match(home.body, /任务与契约/);
     assert.match(home.body, /history.replaceState/);
-    assert.deepEqual(JSON.parse((await http(panel, '/api/snapshot')).body), snap);
-  });
+    assert.deepEqual(JSON.parse((await http(panel, '/api/snapshot')).body), { ...snap, panel_agent: 'default' });
+  }));
+  await withAgent('panel-owner', () => withPanel(async (panel) => {
+    assert.deepEqual(JSON.parse((await http(panel, '/api/snapshot')).body), { ...snap, panel_agent: 'panel-owner' });
+  }));
 });
 
 test('非本地 Host 403；OPTIONS 405；未知路径 404；没有 CORS 头', async () => {

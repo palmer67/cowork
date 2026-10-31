@@ -11,6 +11,19 @@ const snap: Snapshot = {
   tasks: [{ id: 't-123abc', title: '</script><b>payload</b>', status: 'ready', touches: ['src/a.ts'], reads: [], depends_on: [], done_when: [], assigned_lane: null, agent: null, spec_commit: null, updated_at: null, blocked_reason: null }],
 };
 
+function ownedTask(id: string, status: string) {
+  return { ...snap.tasks[0]!, id, status, assigned_lane: 'dsh', agent: 'dsh' };
+}
+
+function actionMarkup(board: string, id: string, action: string): string {
+  const needle = `data-api="/api/task/${id}/${action}"`;
+  const at = board.indexOf(needle);
+  assert.notEqual(at, -1, `missing ${needle}`);
+  const start = board.lastIndexOf('<button', at);
+  const end = board.indexOf('</button>', at) + '</button>'.length;
+  return board.slice(start, end);
+}
+
 test('静态操作只复制命令，不包含网络请求与可写表单', () => {
   const html = renderPanel(snap);
   assert.match(html, /复制命令/);
@@ -33,9 +46,24 @@ test('serve 页面脚本可解析，共享浏览器渲染与服务器渲染逐�
   assert.doesNotMatch(main, /alert\(/);
 });
 
-test('按状态禁用动作，车道 error 时禁止派工并提示重开', () => {
-  const board = renderBoard({ ...snap, lanes: [{ ...snap.lanes[0]!, error: 'missing' }] }, { serve: true });
-  assert.match(board, /disabled title="车道不可用，请核对工作树后重开面板"/);
-  assert.match(board, /disabled title="当前 ready；仅 claimed 可用"/);
-  assert.match(board, /data-dispatch[^>]*disabled/);
+test('按状态与 owner 禁用动作；ready/confirm-merge 不受 owner 限制', () => {
+  const invalidLaneBoard = renderBoard({ ...snap, lanes: [{ ...snap.lanes[0]!, error: 'missing' }] }, { serve: true });
+  assert.match(invalidLaneBoard, /disabled title="车道不可用，请核对工作树后重开面板"/);
+  assert.match(invalidLaneBoard, /disabled title="当前 ready；仅 claimed 可用"/);
+  assert.match(invalidLaneBoard, /data-dispatch[^>]*disabled/);
+  const tasks = [
+    ownedTask('t-start01', 'claimed'), ownedTask('t-report1', 'in_progress'),
+    ownedTask('t-block01', 'in_progress'), ownedTask('t-cancel1', 'claimed'),
+    ownedTask('t-ready01', 'draft'), ownedTask('t-merge01', 'reported_done'),
+  ];
+  const board = renderBoard({ ...snap, panel_agent: 'panel-operator', tasks }, { serve: true });
+  for (const [id, action] of [['t-start01', 'start'], ['t-report1', 'report-done'], ['t-block01', 'block'], ['t-cancel1', 'cancel']]) {
+    assert.match(actionMarkup(board, id, action), /disabled title="需在车道 dsh 内由 dsh 执行"/);
+  }
+  assert.match(board, /<code class="mono">cowork task start t-start01<\/code>/);
+  assert.match(board, /data-copy="cowork task start t-start01"/);
+  assert.doesNotMatch(actionMarkup(board, 't-ready01', 'ready'), /\sdisabled(?:\s|>)/);
+  assert.doesNotMatch(actionMarkup(board, 't-merge01', 'confirm-merge'), /\sdisabled(?:\s|>)/);
+  const matching = renderBoard({ ...snap, panel_agent: 'dsh', tasks: [ownedTask('t-owned01', 'claimed')] }, { serve: true });
+  assert.doesNotMatch(actionMarkup(matching, 't-owned01', 'start'), /\sdisabled(?:\s|>)/);
 });

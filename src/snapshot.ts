@@ -81,6 +81,8 @@ export interface ContractAlert {
 export interface Snapshot {
   schemaVersion: 1;
   generatedAt: string;
+  /** 面板服务响应附加的调用身份；CLI snapshot 本身不输出此字段。 */
+  panel_agent?: string;
   repo: { root: string; head: string | null; trunk?: string };
   tasks: SnapshotTask[];
   task_diagnostics: string[];

@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { realpathSync } from 'node:fs';
 import type { RepoInfo } from './git.ts';
+import type { Snapshot } from './snapshot.ts';
 import { renderPanel } from './ui.ts';
 
 const execFile = promisify(execFileCallback);
@@ -63,6 +64,12 @@ function send(res: ServerResponse, status: number, body: string, type = 'applica
 
 function json(res: ServerResponse, status: number, value: unknown): void {
   send(res, status, JSON.stringify(value));
+}
+
+function withPanelAgent(stdout: string, panelAgent: string): Snapshot {
+  const value: unknown = JSON.parse(stdout);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new Error('cowork snapshot --json 返回的不是对象');
+  return { ...(value as Snapshot), panel_agent: panelAgent };
 }
 
 function authorizedToken(expected: string, actual: string | null): boolean {
@@ -175,10 +182,20 @@ function requestToken(req: IncomingMessage, url: URL): string | null {
 
 export function createPanelServer(info: RepoInfo, options: PanelServerOptions): PanelServer {
   const token = randomBytes(16).toString('hex');
+  const panelAgent = process.env.COWORK_AGENT_ID || 'default';
   const execute = options.execute ?? ((args, cwd, agent) => runCli(options.cliPath, args, cwd, agent));
   let activePort = options.port;
   let snapshotCache: { expires: number; result: CliResult } | null = null;
   let writeTail: Promise<unknown> = Promise.resolve();
+
+  const respondWithSnapshot = (res: ServerResponse, result: CliResult): void => {
+    if (result.code !== 0) {
+      send(res, 500, result.stdout || result.stderr);
+      return;
+    }
+    try { json(res, 200, withPanelAgent(result.stdout, panelAgent)); }
+    catch (err) { send(res, 500, err instanceof Error ? err.message : String(err), 'text/plain; charset=utf-8'); }
+  };
 
   const server = createServer((req, res) => {
     void (async () => {
@@ -211,7 +228,7 @@ export function createPanelServer(info: RepoInfo, options: PanelServerOptions): 
           return;
         }
         try {
-          const snap = JSON.parse(result.stdout);
+          const snap = withPanelAgent(result.stdout, panelAgent);
           send(res, 200, renderPanel(snap, { serve: true }), 'text/html; charset=utf-8');
         } catch (err) {
           send(res, 500, `cowork snapshot --json 返回无效 JSON: ${err instanceof Error ? err.message : String(err)}`, 'text/plain; charset=utf-8');
@@ -220,12 +237,12 @@ export function createPanelServer(info: RepoInfo, options: PanelServerOptions): 
       }
       if (req.method === 'GET' && url.pathname === '/api/snapshot') {
         if (snapshotCache !== null && snapshotCache.expires > Date.now()) {
-          send(res, snapshotCache.result.code === 0 ? 200 : 500, snapshotCache.result.stdout || snapshotCache.result.stderr);
+          respondWithSnapshot(res, snapshotCache.result);
           return;
         }
         const result = await execute(['snapshot', '--json'], info.mainRoot);
         if (result.code === 0) snapshotCache = { expires: Date.now() + 1000, result };
-        send(res, result.code === 0 ? 200 : 500, result.stdout || result.stderr);
+        respondWithSnapshot(res, result);
         return;
       }
       const taskMatch = /^\/api\/tasks\/([^/]+)$/.exec(url.pathname);

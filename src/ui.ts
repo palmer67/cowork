@@ -172,14 +172,25 @@ function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options
     ['confirm-merge', '确认合并', ['reported_done']], ['block', '标记阻塞', ['claimed', 'in_progress']],
     ['cancel', '取消任务', ['draft', 'ready', 'claimed', 'in_progress', 'reported_done', 'blocked', 'merged']],
   ];
+  const panelAgent = options.panelAgent ?? 'default';
+  const ownerless = task.assigned_lane === null && task.agent === null;
+  const ownerMatches = ownerless || (task.assigned_lane === panelAgent && task.agent === panelAgent);
+  let ownerMismatch = false;
   const buttons = definitions.map(([action, label, states]) => {
-    const reason = invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${states.join(' / ')} 可用` : '';
+    const needsOwner = action === 'start' || action === 'report-done' || action === 'block' || action === 'cancel';
+    const mismatch = needsOwner && !ownerMatches;
+    ownerMismatch ||= mismatch;
+    const ownerReason = `需在车道 ${task.assigned_lane ?? '未分配'} 内由 ${task.agent ?? '未分配'} 执行`;
+    const reason = mismatch ? ownerReason : invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${states.join(' / ')} 可用` : '';
     const form = action === 'confirm-merge' || action === 'block' || action === 'cancel' ? action : '';
     return actionButton(label, `/api/task/${encodeURIComponent(task.id)}/${action}`, `cowork task ${action} ${task.id}`, true, reason, form);
   }).join('');
   const choices = lanes.filter((lane) => lane.lane !== null && lane.error === undefined && /^[A-Za-z0-9._-]+$/.test(lane.lane)).map((lane) => `<option value="${escapeHtml(lane.lane!)}">${escapeHtml(lane.lane!)}</option>`).join('');
   const dispatch = `<div class="dispatch"><select aria-label="${escapeHtml(task.id)} 的车道"${task.status === 'ready' && choices !== '' ? '' : ' disabled'}>${choices}</select><button type="button" data-dispatch title="按队列顺序与依赖领取下一个任务"${task.status === 'ready' && choices !== '' ? '' : ' disabled'}>派给车道</button></div>`;
-  return buttons + dispatch;
+  const ownerCommand = ownerMismatch
+    ? `<div class="sub mono"><code class="mono">cowork task start ${escapeHtml(task.id)}</code>${actionButton('', '', `cowork task start ${task.id}`, false)}</div>`
+    : '';
+  return buttons + dispatch + ownerCommand;
 }
 
 function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLane[] = [], options: RenderOptions = {}): string {
@@ -321,6 +332,7 @@ export interface RenderOptions {
   /** `ui --watch` 时传整秒间隔：页面用 meta refresh 自己重载，浏览器不需要人按 F5。 */
   refreshSeconds?: number | undefined;
   serve?: boolean;
+  panelAgent?: string | undefined;
 }
 
 /** 三块表的唯一渲染函数；前台轮询也复用此函数及其纯函数依赖。 */
@@ -328,6 +340,7 @@ export function renderBoard(snap: Snapshot, options: RenderOptions = {}): string
   const dirtyLanes = snap.lanes.filter((lane) => lane.dirty === true).length;
   const expiredClaims = snap.claims.filter((claim) => claim.expired).length;
   const blockedTasks = snap.tasks.filter((task) => task.status === 'blocked').length;
+  const taskOptions = options.serve ? { ...options, panelAgent: snap.panel_agent ?? options.panelAgent ?? 'default' } : options;
   return `<section class="card">
   <div class="card-head"><h2>工作树</h2><span class="sub">${snap.lanes.length} 条${snap.lanes.length === 0 ? '' : `，${dirtyLanes} 条有未提交改动`}</span></div>
   <div class="card-body table-wrap">${renderLanes(snap.lanes, options)}</div>
@@ -338,7 +351,7 @@ export function renderBoard(snap: Snapshot, options: RenderOptions = {}): string
 </section>
 <section class="card">
   <div class="card-head"><h2>任务与契约</h2><span class="sub">${snap.tasks.length} 个${blockedTasks > 0 ? `，${blockedTasks} 个被阻塞` : ''}${snap.task_diagnostics.length > 0 ? `，${snap.task_diagnostics.length} 条读取失败` : ''}</span></div>
-  <div class="card-body table-wrap">${renderTasks(snap.tasks, snap.lanes, options)}${renderTaskDiagnostics(snap.task_diagnostics)}${renderAlerts(snap.contract_alerts)}</div>
+  <div class="card-body table-wrap">${renderTasks(snap.tasks, snap.lanes, taskOptions)}${renderTaskDiagnostics(snap.task_diagnostics)}${renderAlerts(snap.contract_alerts)}</div>
 </section>`;
 }
 
@@ -438,9 +451,26 @@ ${renderer}
   document.querySelector('#close-dialog').addEventListener('click', () => dialog.close());
   document.querySelector('#refresh').addEventListener('click', () => refresh(true));
   document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(false); });
-  document.addEventListener('click', (event) => {
+  document.addEventListener('click', async (event) => {
     const button = event.target.closest('button');
-    if (!button || button.disabled || busy) return;
+    if (!button || busy) return;
+    if (button.hasAttribute('data-copy')) {
+      const command = button.dataset.copy;
+      result.hidden = false; result.open = true;
+      result.querySelector('.command').textContent = command;
+      try {
+        if (navigator.clipboard) await navigator.clipboard.writeText(command);
+        else {
+          const field = document.createElement('textarea'); field.value = command;
+          document.body.append(field); field.select();
+          const copied = document.execCommand('copy'); field.remove();
+          if (!copied) throw new Error('请选中下方命令手动复制');
+        }
+        result.querySelector('summary').textContent = '命令已复制';
+      } catch (err) { result.querySelector('summary').textContent = String(err.message || err); }
+      return;
+    }
+    if (button.disabled) return;
     if (button.dataset.open) {
       const kind = button.dataset.open;
       const route = kind === 'lane' ? '/api/lane/new' : kind === 'task' ? '/api/task/add' : '/api/import';

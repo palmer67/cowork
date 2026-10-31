@@ -61,7 +61,12 @@ function diagnosticsCell(lane: SnapshotLane): string {
   return `<ul class="diag">${lines.map((line) => `<li>${escapeHtml(line)}</li>`).join('')}</ul>`;
 }
 
-function renderLanes(lanes: readonly SnapshotLane[]): string {
+function actionButton(label: string, route: string, command: string, serve: boolean, reason = '', form = ''): string {
+  if (!serve) return `<button type="button" data-copy="${escapeHtml(command)}" title="${escapeHtml(command)}">复制命令</button>`;
+  return `<button type="button" data-api="${escapeHtml(route)}" data-command="${escapeHtml(command)}"${form === '' ? '' : ` data-form="${escapeHtml(form)}"`}${reason === '' ? '' : ` disabled title="${escapeHtml(reason)}"`}>${escapeHtml(label)}</button>`;
+}
+
+function renderLanes(lanes: readonly SnapshotLane[], options: RenderOptions = {}): string {
   if (lanes.length === 0) {
     return '<p class="empty">没有可读的工作树。git worktree list 应至少包含主工作树。</p>';
   }
@@ -71,7 +76,7 @@ function renderLanes(lanes: readonly SnapshotLane[]): string {
       const err =
         lane.error === undefined
           ? ''
-          : `<tr class="err-row"><td colspan="6"><p class="err">${escapeHtml(lane.error)}</p></td></tr>`;
+          : `<tr class="err-row"><td colspan="7"><p class="err">${escapeHtml(lane.error)}</p></td></tr>`;
       const branch =
         lane.branch === null
           ? badge('detached', 'warn')
@@ -91,11 +96,21 @@ function renderLanes(lanes: readonly SnapshotLane[]): string {
   <td>${changesCell(lane)}</td>
   <td>${handoffCell(lane.last_handoff)}${diagnosticsCell(lane)}</td>
   <td>${observed}</td>
+  <td class="actions">${lane.lane === null ? (options.serve ? '<span class="sub">主工作树</span>' : actionButton('', '', 'cowork snapshot --json', false)) : (() => {
+    const route = `/api/lane/${encodeURIComponent(lane.lane)}/next`;
+    const command = options.serve ? `cowork next --agent ${lane.lane}  (cwd: .cowork/lanes/${lane.lane})` : `cd ${JSON.stringify(`.cowork/lanes/${lane.lane}`)}; cowork next --agent ${lane.lane}`;
+    const invalidName = !/^[A-Za-z0-9._-]+$/.test(lane.lane);
+    const reason = lane.error !== undefined || invalidName ? '车道不可用，请核对工作树后重开面板' : '';
+    const next = actionButton('在此车道派工', route, command, options.serve === true, reason);
+    const briefCommand = options.serve ? `cowork brief --agent ${lane.lane}` : `cd ${JSON.stringify(`.cowork/lanes/${lane.lane}`)}; cowork brief --agent ${lane.lane}`;
+    const brief = actionButton('查看 brief', `/api/brief?lane=${encodeURIComponent(lane.lane)}`, briefCommand, options.serve === true, reason);
+    return next + brief;
+  })()}</td>
 </tr>${err}`;
     })
     .join('');
   return `<table>
-<thead><tr><th>车道</th><th>分支</th><th>HEAD</th><th>未提交</th><th>最近交接</th><th>采样时间</th></tr></thead>
+<thead><tr><th>车道</th><th>分支</th><th>HEAD</th><th>未提交</th><th>最近交接</th><th>采样时间</th><th>操作</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>`;
 }
@@ -146,7 +161,39 @@ function statusBadge(status: string): string {
   return badge(status, STATUS_TONES[status]);
 }
 
-function renderTasks(tasks: readonly SnapshotTask[]): string {
+function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options: RenderOptions): string {
+  if (!options.serve) {
+    const action = task.status === 'draft' ? 'ready' : task.status === 'claimed' ? 'start' : task.status === 'in_progress' ? 'report-done' : task.status === 'reported_done' ? 'confirm-merge' : 'show';
+    return actionButton('', '', `cowork task ${action} ${task.id}${action === 'confirm-merge' ? ' --commit <sha> --manual --reason "<依据>"' : ''}`, false);
+  }
+  const invalidLane = task.assigned_lane === null ? false : !lanes.some((lane) => lane.lane === task.assigned_lane && lane.error === undefined);
+  const definitions: [string, string, string[]][] = [
+    ['ready', '审核就绪', ['draft']], ['start', '开始', ['claimed']], ['report-done', '标记完成', ['in_progress']],
+    ['confirm-merge', '确认合并', ['reported_done']], ['block', '标记阻塞', ['claimed', 'in_progress']],
+    ['cancel', '取消任务', ['draft', 'ready', 'claimed', 'in_progress', 'reported_done', 'blocked', 'merged']],
+  ];
+  const panelAgent = options.panelAgent ?? 'default';
+  const ownerless = task.assigned_lane === null && task.agent === null;
+  const ownerMatches = ownerless || (task.assigned_lane === panelAgent && task.agent === panelAgent);
+  let ownerMismatch = false;
+  const buttons = definitions.map(([action, label, states]) => {
+    const needsOwner = action === 'start' || action === 'report-done' || action === 'block' || action === 'cancel';
+    const mismatch = needsOwner && !ownerMatches;
+    ownerMismatch ||= mismatch;
+    const ownerReason = `需在车道 ${task.assigned_lane ?? '未分配'} 内由 ${task.agent ?? '未分配'} 执行`;
+    const reason = mismatch ? ownerReason : invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${states.join(' / ')} 可用` : '';
+    const form = action === 'confirm-merge' || action === 'block' || action === 'cancel' ? action : '';
+    return actionButton(label, `/api/task/${encodeURIComponent(task.id)}/${action}`, `cowork task ${action} ${task.id}`, true, reason, form);
+  }).join('');
+  const choices = lanes.filter((lane) => lane.lane !== null && lane.error === undefined && /^[A-Za-z0-9._-]+$/.test(lane.lane)).map((lane) => `<option value="${escapeHtml(lane.lane!)}">${escapeHtml(lane.lane!)}</option>`).join('');
+  const dispatch = `<div class="dispatch"><select aria-label="${escapeHtml(task.id)} 的车道"${task.status === 'ready' && choices !== '' ? '' : ' disabled'}>${choices}</select><button type="button" data-dispatch title="按队列顺序与依赖领取下一个任务"${task.status === 'ready' && choices !== '' ? '' : ' disabled'}>派给车道</button></div>`;
+  const ownerCommand = ownerMismatch
+    ? `<div class="sub mono"><code class="mono">cowork task start ${escapeHtml(task.id)}</code>${actionButton('', '', `cowork task start ${task.id}`, false)}</div>`
+    : '';
+  return buttons + dispatch + ownerCommand;
+}
+
+function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLane[] = [], options: RenderOptions = {}): string {
   if (tasks.length === 0) {
     return '<p class="empty">还没有任务。cowork task add 创建 spec，cowork next 领取。</p>';
   }
@@ -175,11 +222,12 @@ function renderTasks(tasks: readonly SnapshotTask[]): string {
   <td>${lane}${agent}</td>
   <td>${deps}</td>
   <td>${spec}</td>
+  <td class="actions">${taskActions(task, lanes, options)}</td>
 </tr>`;
     })
     .join('');
   return `<table>
-<thead><tr><th>任务</th><th>状态</th><th>车道 / agent</th><th>依赖</th><th>spec</th></tr></thead>
+<thead><tr><th>任务</th><th>状态</th><th>车道 / agent</th><th>依赖</th><th>spec</th><th>操作</th></tr></thead>
 <tbody>${rows}</tbody>
 </table>`;
 }
@@ -215,6 +263,7 @@ const STYLE = `
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif;padding:28px 20px 56px}
 .wrap{max-width:1180px;margin:0 auto;display:grid;gap:16px}
+#board{display:grid;gap:16px;min-width:0;width:100%}
 header{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:baseline}
 h1{font-size:20px;margin:0;font-weight:650}
 h2{font-size:13px;margin:0;font-weight:650;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
@@ -244,15 +293,21 @@ tr[hidden]{display:none}
 .empty{margin:0;padding:20px 0;color:var(--muted);font-size:13px}
 .err{margin:10px 0;padding:9px 12px;border-radius:9px;background:var(--bad-bg);color:var(--bad);font-size:12.5px;white-space:pre-wrap;overflow-wrap:anywhere}
 footer{color:var(--muted);font-size:12px;padding:2px 2px 0}
+button,input,textarea,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 9px}
+button{cursor:pointer}button:hover:not(:disabled){border-color:var(--accent);color:var(--accent)}button:focus-visible,input:focus-visible,textarea:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button:disabled,select:disabled{opacity:.45;cursor:not-allowed}.actions{min-width:200px;max-width:330px}.actions button{font-size:12px;margin:0 4px 5px 0}.dispatch{display:flex;gap:5px;align-items:baseline}
+.panel-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.panel-toolbar #refresh{margin-left:auto}dialog{width:min(520px,95vw);max-height:90vh;overflow:auto;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:22px}dialog::backdrop{background:#0007}
+dialog h2{font-size:17px;color:var(--ink);margin-bottom:16px}dialog form,#form-fields{display:grid;gap:12px}dialog label{display:grid;gap:4px}textarea{min-height:65px;resize:vertical}.form-actions{display:flex;gap:8px;justify-content:flex-end}.primary{background:var(--accent);color:var(--panel)}
+.result{padding:14px 16px}.result summary{cursor:pointer;font-weight:600}.result pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12.5px/1.6 var(--mono);max-height:340px;overflow:auto}.result[data-code="0"]{border-left:3px solid var(--ok)}.result[data-code="1"],.result[data-code="2"],.result[data-code="3"]{border-left:3px solid var(--warn)}
 `;
 
 const FILTER_SCRIPT = `<script>
 (() => {
   const input = document.getElementById('filter');
   if (input === null) return;
-  const rows = Array.from(document.querySelectorAll('tbody tr:not(.err-row)'));
-  const errors = Array.from(document.querySelectorAll('tbody tr.err-row'));
   const apply = () => {
+    const rows = Array.from(document.querySelectorAll('tbody tr:not(.err-row)'));
+    const errors = Array.from(document.querySelectorAll('tbody tr.err-row'));
     const q = input.value.trim().toLowerCase();
     for (const row of rows) row.hidden = q !== '' && !row.textContent.toLowerCase().includes(q);
     for (const row of errors) row.hidden = q !== '';
@@ -261,6 +316,7 @@ const FILTER_SCRIPT = `<script>
   const saved = new URLSearchParams(location.hash.slice(1)).get('filter');
   if (saved !== null) input.value = saved;
   apply();
+  document.addEventListener('cowork:updated', apply);
   input.addEventListener('input', () => {
     apply();
     try {
@@ -275,15 +331,182 @@ const FILTER_SCRIPT = `<script>
 export interface RenderOptions {
   /** `ui --watch` 时传整秒间隔：页面用 meta refresh 自己重载，浏览器不需要人按 F5。 */
   refreshSeconds?: number | undefined;
+  serve?: boolean;
+  panelAgent?: string | undefined;
+}
+
+/** 三块表的唯一渲染函数；前台轮询也复用此函数及其纯函数依赖。 */
+export function renderBoard(snap: Snapshot, options: RenderOptions = {}): string {
+  const dirtyLanes = snap.lanes.filter((lane) => lane.dirty === true).length;
+  const expiredClaims = snap.claims.filter((claim) => claim.expired).length;
+  const blockedTasks = snap.tasks.filter((task) => task.status === 'blocked').length;
+  const taskOptions = options.serve ? { ...options, panelAgent: snap.panel_agent ?? options.panelAgent ?? 'default' } : options;
+  return `<section class="card">
+  <div class="card-head"><h2>工作树</h2><span class="sub">${snap.lanes.length} 条${snap.lanes.length === 0 ? '' : `，${dirtyLanes} 条有未提交改动`}</span></div>
+  <div class="card-body table-wrap">${renderLanes(snap.lanes, options)}</div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>占位</h2><span class="sub">${snap.claims.length} 个${expiredClaims > 0 ? `，其中 ${expiredClaims} 个已过期` : ''}</span></div>
+  <div class="card-body table-wrap">${renderClaims(snap.claims)}</div>
+</section>
+<section class="card">
+  <div class="card-head"><h2>任务与契约</h2><span class="sub">${snap.tasks.length} 个${blockedTasks > 0 ? `，${blockedTasks} 个被阻塞` : ''}${snap.task_diagnostics.length > 0 ? `，${snap.task_diagnostics.length} 条读取失败` : ''}</span></div>
+  <div class="card-body table-wrap">${renderTasks(snap.tasks, snap.lanes, taskOptions)}${renderTaskDiagnostics(snap.task_diagnostics)}${renderAlerts(snap.contract_alerts)}</div>
+</section>`;
+}
+
+const RESULT = `<details id="result" class="card result" aria-live="polite" hidden><summary></summary><p class="mono command"></p><pre class="stdout"></pre><pre class="stderr"></pre></details>`;
+
+const COPY_SCRIPT = `<script>
+document.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-copy]');
+  if (!button) return;
+  const command = button.dataset.copy;
+  const result = document.querySelector('#result');
+  result.hidden = false; result.open = true;
+  result.querySelector('.command').textContent = command;
+  try {
+    if (navigator.clipboard) await navigator.clipboard.writeText(command);
+    else {
+      const field = document.createElement('textarea'); field.value = command;
+      document.body.append(field); field.select();
+      const copied = document.execCommand('copy'); field.remove();
+      if (!copied) throw new Error('请选中下方命令手动复制');
+    }
+    result.querySelector('summary').textContent = '命令已复制';
+  } catch (err) { result.querySelector('summary').textContent = String(err.message || err); }
+});
+</script>`;
+
+const FORMS = `<div class="panel-toolbar">
+<button type="button" data-open="lane">新建车道</button><button type="button" data-open="task">新建任务</button><button type="button" data-open="import">导入计划</button><span class="sub">派工按队列顺序与依赖领取</span><button type="button" id="refresh">刷新</button>
+</div>
+<dialog id="action-dialog"><h2 id="dialog-title"></h2><form id="action-form"><div id="form-fields"></div><div class="form-actions"><button type="button" id="close-dialog">返回</button><button type="submit" class="primary">执行</button></div></form></dialog>`;
+
+function panelScript(): string {
+  // 函数源码没有用户数据；共享服务器与浏览器渲染，避免双份表格模板漂移。
+  const helpers = [escapeHtml, localTime, badge, changesCell, handoffCell, diagnosticsCell, actionButton, renderLanes, renderClaims, statusBadge, taskActions, renderTasks, renderAlerts, renderTaskDiagnostics, renderBoard];
+  const renderer = `const HTML_ESCAPES=${JSON.stringify(HTML_ESCAPES)};const STATUS_TONES=${JSON.stringify(STATUS_TONES)};` + helpers.map((fn) => `const ${fn.name}=${fn.toString()};`).join('\n');
+  return `<script>
+(() => {
+${renderer}
+  const token = new URLSearchParams(location.search).get('t');
+  history.replaceState(null, '', location.pathname + location.hash);
+  const board = document.querySelector('#board');
+  const result = document.querySelector('#result');
+  const dialog = document.querySelector('#action-dialog');
+  const form = document.querySelector('#action-form');
+  let target = null;
+  let busy = false;
+  let sampling = false;
+  function output(command, value) {
+    result.hidden = false; result.open = true;
+    result.dataset.code = String(value.code);
+    result.querySelector('summary').textContent = 'exit ' + value.code;
+    result.querySelector('.command').textContent = command;
+    result.querySelector('.stdout').textContent = value.stdout || '';
+    result.querySelector('.stderr').textContent = value.stderr || '';
+  }
+  async function api(route, body) {
+    const response = await fetch(route, { method: body === undefined ? 'GET' : 'POST', headers: { 'X-Cowork-Token': token, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const text = await response.text();
+    if (!response.ok) throw new Error('HTTP ' + response.status + ': ' + text);
+    return JSON.parse(text);
+  }
+  async function refresh(force) {
+    if (sampling || (!force && (document.hidden || busy || board.contains(document.activeElement)))) return;
+    sampling = true;
+    try {
+      const snap = await api('/api/snapshot');
+      board.innerHTML = renderBoard(snap, { serve: true });
+      document.querySelector('#as-of').textContent = '数据截至 ' + localTime(snap.generatedAt);
+      document.querySelector('#trunk').textContent = 'trunk ' + (snap.repo.trunk || '未知');
+      document.querySelector('#main-head').textContent = '主工作树 HEAD ' + (snap.repo.head || '?');
+      document.dispatchEvent(new Event('cowork:updated'));
+    } catch (err) { output('cowork snapshot --json', { code: 1, stderr: String(err.message || err) }); }
+    finally { sampling = false; }
+  }
+  async function execute(route, body, command) {
+    if (busy) return;
+    busy = true;
+    const submit = form.querySelector('[type=submit]'); submit.disabled = true;
+    try { output(command, await api(route, body)); dialog.close(); }
+    catch (err) { output(command, { code: 1, stderr: String(err.message || err) }); }
+    finally { busy = false; submit.disabled = false; await refresh(true); }
+  }
+  const fields = {
+    lane: [['name','车道名称',true],['base','基点（可选）',false]],
+    task: [['title','任务标题',true],['touches','写入路径（每行一项）',true],['reads','读取路径（每行一项）',false],['depends_on','依赖任务 id（每行一项）',false],['done_when','验收命令（每行一项）',false]],
+    import: [['path','计划文件路径（相对仓库根）',true]],
+    'confirm-merge': [['commit','合并提交 SHA',true],['reason','人工确认依据',true]],
+    block: [['reason','阻塞原因',true]], cancel: [['reason','取消原因（可选）',false]]
+  };
+  const titles = { lane:'新建车道',task:'新建任务',import:'导入计划','confirm-merge':'确认合并',block:'标记阻塞',cancel:'取消任务' };
+  function open(kind, route, command) {
+    target = { kind, route, command };
+    document.querySelector('#dialog-title').textContent = titles[kind];
+    document.querySelector('#form-fields').innerHTML = fields[kind].map(([name,label,required]) => '<label>' + label + '<' + (['touches','reads','depends_on','done_when'].includes(name) ? 'textarea' : 'input') + ' name="' + name + '" ' + (required ? 'required' : '') + (name === 'title' ? ' maxlength="120"' : '') + '>' + (['touches','reads','depends_on','done_when'].includes(name) ? '</textarea>' : '') + '</label>').join('') + (kind === 'import' ? '<label><span><input type="checkbox" name="dry_run"> 仅预览，不写入</span></label>' : '');
+    dialog.showModal();
+  }
+  document.querySelector('#close-dialog').addEventListener('click', () => dialog.close());
+  document.querySelector('#refresh').addEventListener('click', () => refresh(true));
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) void refresh(false); });
+  document.addEventListener('click', async (event) => {
+    const button = event.target.closest('button');
+    if (!button || busy) return;
+    if (button.hasAttribute('data-copy')) {
+      const command = button.dataset.copy;
+      result.hidden = false; result.open = true;
+      result.querySelector('.command').textContent = command;
+      try {
+        if (navigator.clipboard) await navigator.clipboard.writeText(command);
+        else {
+          const field = document.createElement('textarea'); field.value = command;
+          document.body.append(field); field.select();
+          const copied = document.execCommand('copy'); field.remove();
+          if (!copied) throw new Error('请选中下方命令手动复制');
+        }
+        result.querySelector('summary').textContent = '命令已复制';
+      } catch (err) { result.querySelector('summary').textContent = String(err.message || err); }
+      return;
+    }
+    if (button.disabled) return;
+    if (button.dataset.open) {
+      const kind = button.dataset.open;
+      const route = kind === 'lane' ? '/api/lane/new' : kind === 'task' ? '/api/task/add' : '/api/import';
+      open(kind, route, kind === 'lane' ? 'cowork lane new' : kind === 'task' ? 'cowork task add' : 'cowork task import');
+    } else if (button.hasAttribute('data-dispatch')) {
+      const lane = button.parentElement.querySelector('select').value;
+      execute('/api/lane/' + encodeURIComponent(lane) + '/next', {}, 'cowork next --agent ' + lane + ' (cwd: .cowork/lanes/' + lane + ')');
+    } else if (button.dataset.api) {
+      if (button.dataset.form) open(button.dataset.form, button.dataset.api, button.dataset.command);
+      else execute(button.dataset.api, button.dataset.api.startsWith('/api/brief?') ? undefined : {}, button.dataset.command);
+    }
+  });
+  form.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!target || busy || !form.reportValidity()) return;
+    const data = new FormData(form); const body = {};
+    for (const [key, value] of data) if (value !== '') body[key] = ['touches','reads','depends_on','done_when'].includes(key) ? value.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean) : value;
+    if (target.kind === 'import') body.dry_run = data.has('dry_run');
+    let command = target.command;
+    if (target.kind === 'lane') command += ' ' + JSON.stringify(body.name) + (body.base ? ' --base ' + JSON.stringify(body.base) : '');
+    else if (target.kind === 'import') command += ' ' + JSON.stringify(body.path) + (body.dry_run ? ' --dry-run' : '');
+    else if (target.kind === 'task') {
+      command += ' --title ' + JSON.stringify(body.title);
+      for (const [key, flag] of [['touches','touches'],['reads','reads'],['depends_on','depends'],['done_when','done-when']]) for (const value of body[key] || []) command += ' --' + flag + ' ' + JSON.stringify(value);
+    } else command += (body.commit ? ' --commit ' + JSON.stringify(body.commit) + ' --manual' : '') + (body.reason ? ' --reason ' + JSON.stringify(body.reason) : '');
+    execute(target.route, body, command);
+  });
+  setInterval(() => refresh(false), 2000);
+})();
+</script>`;
 }
 
 /** 静态单文件面板：自包含、无外部资源、不联网。 */
 export function renderPanel(snap: Snapshot, options: RenderOptions = {}): string {
   const refreshSeconds = options.refreshSeconds;
   const repoName = path.basename(snap.repo.root) === '' ? snap.repo.root : path.basename(snap.repo.root);
-  const dirtyLanes = snap.lanes.filter((lane) => lane.dirty === true).length;
-  const expiredClaims = snap.claims.filter((claim) => claim.expired).length;
-  const blockedTasks = snap.tasks.filter((task) => task.status === 'blocked').length;
   const filterable = snap.lanes.length + snap.claims.length + snap.tasks.length > 0;
   const head = snap.repo.head === null ? '?' : snap.repo.head;
 
@@ -293,7 +516,8 @@ export function renderPanel(snap: Snapshot, options: RenderOptions = {}): string
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 ${refreshSeconds === undefined ? '' : `<meta http-equiv="refresh" content="${refreshSeconds}">`}
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'${options.serve ? "; connect-src 'self'" : ''}">
+<meta name="referrer" content="no-referrer">
 <title>cowork · ${escapeHtml(repoName)}</title>
 <style>${STYLE}</style>
 </head>
@@ -301,56 +525,30 @@ ${refreshSeconds === undefined ? '' : `<meta http-equiv="refresh" content="${ref
 <div class="wrap">
 <header>
   <h1>cowork · ${escapeHtml(repoName)}</h1>
-  <span class="sub">只读面板${refreshSeconds === undefined ? '' : ` · 每 ${refreshSeconds} 秒自动刷新`}</span>
+  <span class="sub">${options.serve ? '派工面板 · 本机前台' : '只读面板'}${refreshSeconds === undefined ? '' : ` · 每 ${refreshSeconds} 秒自动刷新`}</span>
 </header>
 <div class="toolbar mono sub">
   <span title="仓库根">${escapeHtml(snap.repo.root)}</span>
-  <span title="主工作树 HEAD，不一定是 trunk">主工作树 HEAD ${escapeHtml(head)}</span>
-  <span>${
-    refreshSeconds === undefined
+  <span id="main-head" title="主工作树 HEAD，不一定是 trunk">主工作树 HEAD ${escapeHtml(head)}</span>
+  <span id="trunk">trunk ${escapeHtml(snap.repo.trunk ?? '未知')}</span>
+  <span id="as-of">${
+    options.serve ? `数据截至 ${escapeHtml(localTime(snap.generatedAt))}` : refreshSeconds === undefined
       ? `数据截至 ${escapeHtml(localTime(snap.generatedAt))}，进程停止后不会继续更新。`
       : `数据截至 ${escapeHtml(localTime(snap.generatedAt))}，watch 每 ${refreshSeconds} 秒重写。`
   }</span>
 </div>
 ${filterable ? '<input id="filter" type="search" placeholder="过滤车道 / 分支 / 占位 / 任务…" aria-label="过滤表格">' : ''}
-<section class="card">
-  <div class="card-head">
-    <h2>工作树</h2>
-    <span class="sub">${snap.lanes.length} 条${snap.lanes.length === 0 ? '' : `，${dirtyLanes} 条有未提交改动`}</span>
-  </div>
-  <div class="card-body table-wrap">
-    ${renderLanes(snap.lanes)}
-  </div>
-</section>
-<section class="card">
-  <div class="card-head">
-    <h2>占位</h2>
-    <span class="sub">${snap.claims.length} 个${expiredClaims > 0 ? `，其中 ${expiredClaims} 个已过期` : ''}</span>
-  </div>
-  <div class="card-body table-wrap">
-    ${renderClaims(snap.claims)}
-  </div>
-</section>
-<section class="card">
-  <div class="card-head">
-    <h2>任务与契约</h2>
-    <span class="sub">${snap.tasks.length} 个${blockedTasks > 0 ? `，${blockedTasks} 个被阻塞` : ''}${
-      snap.task_diagnostics.length > 0 ? `，${snap.task_diagnostics.length} 条读取失败` : ''
-    }</span>
-  </div>
-  <div class="card-body table-wrap">
-    ${renderTasks(snap.tasks)}
-    ${renderTaskDiagnostics(snap.task_diagnostics)}
-    ${renderAlerts(snap.contract_alerts)}
-  </div>
-</section>
+${options.serve ? FORMS : ''}
+<div id="board">${renderBoard(snap, options)}</div>
+${RESULT}
 <footer>数据只来自 cowork snapshot --json；${
-    refreshSeconds === undefined
+    options.serve ? '每 2 秒采样，切到后台暂停；操作结果保留 CLI 原文，Ctrl+C 结束服务。' : refreshSeconds === undefined
       ? '本页由 cowork ui 生成，不读取 .git/cowork，也不写任何状态。重新运行 cowork ui 可刷新。'
       : `本页由 cowork ui --watch 每 ${refreshSeconds} 秒重写，浏览器按 meta refresh 自动重载；不读取 .git/cowork，也不写任何状态。Ctrl+C 停止 watch。`
   }</footer>
 </div>
 ${filterable ? FILTER_SCRIPT : ''}
+${options.serve ? panelScript() : COPY_SCRIPT}
 </body>
 </html>`;
 }

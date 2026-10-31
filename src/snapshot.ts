@@ -81,7 +81,9 @@ export interface ContractAlert {
 export interface Snapshot {
   schemaVersion: 1;
   generatedAt: string;
-  repo: { root: string; head: string | null };
+  /** 面板服务响应附加的调用身份；CLI snapshot 本身不输出此字段。 */
+  panel_agent?: string;
+  repo: { root: string; head: string | null; trunk?: string };
   tasks: SnapshotTask[];
   task_diagnostics: string[];
   claims: SnapshotClaim[];
@@ -453,7 +455,7 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
   return {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
-    repo: { root: info.mainRoot, head: headCommit(info.mainRoot) },
+    repo: { root: info.mainRoot, head: headCommit(info.mainRoot), trunk: catalog.trunk },
     tasks,
     task_diagnostics: taskDiagnostics,
     claims,

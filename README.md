@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
-  <img alt="tests" src="https://img.shields.io/badge/tests-109%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -21,7 +21,7 @@ Codex 在改 `src/auth/login.ts`，Claude Code 十分钟后也改同一个文件
 - 👀 **共享状态**：谁占了什么、哪条车道有未提交改动、任务到哪一步，一条命令看全；
 - 🧵 **任务队列**：spec 进版本库，`next` 原子领取，进程被杀也能接着干。
 
-纯 CLI + 一个静态 HTML 看板，没有守护进程、没有容器、零运行时依赖。
+纯 CLI + 单文件 HTML 看板，可选本机前台派工面板；没有守护进程、没有容器、零运行时依赖。
 
 ![cowork 看板：工作树、占位、任务与契约三块](docs/assets/board.png)
 
@@ -124,6 +124,33 @@ cowork ui --open                 # 生成并打开
 cowork ui --watch --open         # 前台每 2 秒重写，Ctrl+C 退出
 ```
 
+## 面板派工
+
+让 agent 先产出计划，再由人审阅导入。`plan.json` 示例：
+
+```json
+{"schemaVersion":1,"tasks":[
+  {"key":"token","title":"迁移 token","touches":["src/auth/token.ts"]},
+  {"key":"login","title":"补登录校验","touches":["src/auth/login.ts"],"reads":["src/auth/token.ts"],"depends_on":["token"],"done_when":["npm test"]}
+]}
+```
+
+```bash
+cowork task import plan.json --dry-run # 映射与目标路径，不落盘
+cowork task import plan.json --ready   # 创建 draft；只打印 ready 命令
+git add .cowork/tasks && git commit -m "task: 拆分项目"
+cowork task ready <id>                 # 用输出中的真实 id，逐条审核
+cowork ui --serve --port 7788 --open
+```
+
+面板负责新建车道/任务、导入计划、派工、查看 brief 与人工确认合并；`ready` 是人的审核动作。
+`start`、`report-done`、`block`、`cancel` 仅在面板身份同时匹配任务快照中的车道与 owner agent 时启用。
+面板身份取服务进程的 `COWORK_AGENT_ID`，未设置时为 `default`；不匹配时按钮置灰，任务行提供可复制的
+`cowork task start <id>`，请在对应 owner 车道 CLI 里推进状态。面板不会代填或冒充 owner。
+派工按 FIFO 与依赖领取，每个按钮只执行一次 CLI；底部显示退出码及原始输出。顺序重复派工返回 1，卡片仍显示真实快照。
+只监听 `127.0.0.1`，前台运行，Ctrl+C 结束；端口占用退出 3，可换 `--port`。
+启动 URL 带随机 token，页面读取后抹掉；每 2 秒刷新，切到后台暂停。无服务时仍可用静态看板复制命令。
+
 ## 装一下
 
 要求 **Node ≥ 22.6**、**git ≥ 2.40**，零运行时依赖。
@@ -149,6 +176,8 @@ cowork version
 | `cowork status` / `cowork brief` | 全局占位表 / 本车道摘要 |
 | `cowork snapshot --json` | 只读快照，供脚本和看板消费 |
 | `cowork ui [--watch]` | 生成单文件看板 |
+| `cowork ui --serve [--port 7788] [--open]` | 本机前台派工面板 |
+| `cowork task import <plan.json> [--dry-run] [--ready]` | 校验计划并批量生成 draft；ready 只打印命令 |
 | `cowork task add / ready / show / ls` | 建 spec、进 ready、查队列 |
 | `cowork next` | 原子领取一个 ready 任务（同时占文件） |
 | `cowork task start / report-done / confirm-merge` | 开工 → 交付 → 合并 |
@@ -194,7 +223,7 @@ cowork version
 
 - 不自动拆解任务、不做 LLM 调度、不主动唤醒或推送任务给 agent——谁干活谁自己 `cowork next`；
 - 不做自动 fan-out；并行边界只由依赖、`touches` 和占位决定；
-- 不做写操作后台，不用 Electron，不监听端口；
+- 不做写操作后台、不用 Electron；只有显式 `ui --serve` 监听本机端口；
 - 不用 Docker / WSL，不跑守护进程；
 - 不做 AST 级自动合并，冲突检测只到文件级；
 - 不修改 Codex、Claude Code、DSH 等 agent 的安装或二进制。
@@ -209,11 +238,12 @@ cowork version
 ## 参与开发
 
 ```bash
-npm test                              # 109 个测试：node:test + 真实 git worktree
+npm test                              # 132 个测试：node:test + 真实 git worktree
 npx tsc --noEmit                      # 类型检查
 npm run build                         # 编译到 dist/
 node tools/mutex-gate.mjs             # 并发门槛：8 进程 × 1000 次，不许有一次重叠
 node tools/accept-m1.mjs --with-build # M1 验收（10 条）
+node tools/accept-panel.mjs          # M1.5 验收（13 条，含 test / tsc）
 ```
 
 源码是 TypeScript（ESM，`node:` 前缀），测试用 `node --experimental-strip-types` 直接跑，不经编译。设计文档在 [`docs/`](docs/)，历次交接单在 [`.cowork/notes/`](.cowork/notes/)——cowork 自己也是用它自己管理的。
@@ -223,6 +253,7 @@ node tools/accept-m1.mjs --with-build # M1 验收（10 条）
 - [目标计划：需求、约束、验收标准](docs/PLAN.md)
 - [架构：路径、claim、worktree、失败模式](docs/ARCHITECTURE.md)
 - [任务层协议：任务对象、派工单、snapshot 契约](docs/ARCHITECTURE-TASKS.md)
+- [派工面板：进程、安全边界、API](docs/ARCHITECTURE-PANEL.md)
 - [已定决策（含被推翻的决策与复现路径）](docs/DECISIONS.md)
 
 ## 许可

@@ -25,6 +25,8 @@ import { next } from './tasknext.ts';
 import { doctorTasks } from './taskdoctor.ts';
 import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
+import { importPlan } from './planimport.ts';
+import { createPanelServer, parsePort } from './uiserver.ts';
 
 /** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
 const KNOWN_COMMANDS = new Set([
@@ -61,10 +63,12 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>
   cowork task block <id> --reason <文本>
   cowork task cancel <id> [--reason <文本>]
+  cowork task import <plan.json> [--dry-run] [--ready]
   cowork brief [--agent <名>]    开工摘要（只读）
   cowork lane new <名> [--base <ref>]
                                   创建车道（git worktree，不持锁）
   cowork ui [--out <路径>] [--open]
+  cowork ui --serve [--port <端口>] [--open]
   cowork ui --watch [--interval <秒>]
                                   生成只读看板（静态 HTML，不监听端口）；
                                   --watch 前台重写，Ctrl+C 退出，默认 2 秒
@@ -95,6 +99,7 @@ const VALUE_FLAGS = new Set([
   'reason',
   'commit',
   'base',
+  'port',
 ]);
 
 function parseArgs(argv: readonly string[]): Args {
@@ -353,6 +358,32 @@ async function openQuietly(file: string): Promise<void> {
 async function runUi(info: RepoInfo, args: Args): Promise<number> {
   const out = value(args, 'out') ?? undefined;
   const watching = args.flags.has('watch');
+  if (args.flags.has('serve')) {
+    if (out !== undefined || watching) throw general('--serve 不能和 --out / --watch 一起使用', '用法: cowork ui --serve [--port <端口>] [--open]');
+    if (value(args, 'interval') !== null) throw general('--interval 只能和 --watch 一起用');
+    if (args.flags.has('port')) throw new CoworkError(EXIT.ENV, '--port 缺少端口；请用 --port 7788 或其它空闲端口。');
+    let port: number;
+    try { port = parsePort(value(args, 'port') ?? undefined); }
+    catch (err) { throw new CoworkError(EXIT.ENV, err instanceof Error ? err.message : String(err), '例如: cowork ui --serve --port 7788'); }
+    const cliPath = process.argv[1];
+    if (cliPath === undefined) throw general('无法确定 cowork CLI 入口', '从 node <cli> 启动后重试。');
+    const panel = createPanelServer(info, { port, cliPath: path.resolve(cliPath) });
+    const url = await panel.listen().catch((err: unknown) => {
+      throw new CoworkError(EXIT.ENV, err instanceof Error ? err.message : String(err), '确认端口空闲，或用 --port 指定 1..65535 内的本机端口。');
+    });
+    console.log(`面板已启动: ${url}`);
+    if (args.flags.has('open')) await openQuietly(url);
+    const stop = (): void => { void panel.close(); };
+    process.once('SIGINT', stop);
+    process.once('SIGTERM', stop);
+    process.once('SIGHUP', stop);
+    await new Promise<void>((resolve) => panel.server.once('close', resolve));
+    process.off('SIGINT', stop);
+    process.off('SIGTERM', stop);
+    process.off('SIGHUP', stop);
+    return EXIT.OK;
+  }
+  if (value(args, 'port') !== null) throw general('--port 只能和 --serve 一起用', '用法: cowork ui --serve [--port <端口>]');
   if (!watching && value(args, 'interval') !== null) {
     throw general('--interval 只能和 --watch 一起用', '用法: cowork ui --watch [--interval <秒>]');
   }
@@ -580,6 +611,23 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
       const result = await cancelTask(info, needId(), agent, reason);
       console.log(`${result.live.id} → cancelled`);
       for (const display of result.released) console.log(`  已释放占位 ${display}`);
+      return EXIT.OK;
+    }
+    case 'import': {
+      const file = rest[1] ?? '';
+      if (file === '') throw general('task import 需要 plan.json 路径', '例如: cowork task import plan.json');
+      const result = await importPlan(info, path.resolve(process.cwd(), file), { dryRun: args.flags.has('dry-run') });
+      console.log(`${result.dryRun ? '计划将导入' : '导入'} ${result.tasks.length} 个任务（draft）:`);
+      for (const task of result.tasks) console.log(`  ${task.key.padEnd(18)} → ${task.id}`);
+      console.log('依赖:');
+      for (const task of result.tasks) for (const dep of task.depends_on) console.log(`  ${task.id} depends_on ${dep}`);
+      if (result.dryRun) {
+        console.log('将要写入:');
+        for (const task of result.tasks) console.log(`  ${path.relative(info.mainRoot, task.path)}`);
+        console.log('（dry-run：未写入文件）');
+      }
+      else console.log('下一步: git add .cowork/tasks && git commit -m "task: …"，然后 cowork task ready <id>');
+      if (args.flags.has('ready')) for (const task of result.tasks) console.log(`  cowork task ready ${task.id}`);
       return EXIT.OK;
     }
     default:

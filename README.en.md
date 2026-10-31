@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
-  <img alt="tests" src="https://img.shields.io/badge/tests-109%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -21,7 +21,7 @@ Codex edits `src/auth/login.ts`. Ten minutes later Claude Code edits the same fi
 - 👀 **Shared state** — who holds what, which lane has uncommitted changes, where each task stands: one command, whole picture;
 - 🧵 **Task queue** — specs live in the repo, `next` claims atomically, and a killed process picks up where it left off.
 
-A CLI plus a static HTML board. No daemon, no containers, zero runtime dependencies.
+A CLI plus a single-file HTML board, with an optional local foreground control panel. No daemon, no containers, zero runtime dependencies.
 
 ![The cowork board: worktrees, claims, tasks and contract alerts](docs/assets/board.png)
 
@@ -124,6 +124,35 @@ cowork ui --open                 # render and open
 cowork ui --watch --open         # rewrite every 2s in the foreground, Ctrl+C to stop
 ```
 
+## Dispatch from the panel
+
+Have an agent produce a plan, then review and import it. Example `plan.json`:
+
+```json
+{"schemaVersion":1,"tasks":[
+  {"key":"token","title":"Migrate tokens","touches":["src/auth/token.ts"]},
+  {"key":"login","title":"Validate login","touches":["src/auth/login.ts"],"reads":["src/auth/token.ts"],"depends_on":["token"],"done_when":["npm test"]}
+]}
+```
+
+```bash
+cowork task import plan.json --dry-run # preview IDs and paths, no writes
+cowork task import plan.json --ready   # create drafts; only print ready commands
+git add .cowork/tasks && git commit -m "task: project plan"
+cowork task ready <id>                 # review each generated ID
+cowork ui --serve --port 7788 --open
+```
+
+The panel creates lanes/tasks, imports plans, dispatches work, reads briefs, and confirms merges manually; `ready` is a human review action.
+`start`, `report-done`, `block`, and `cancel` are enabled only when the panel identity matches both the lane and owner agent in the task snapshot.
+Panel identity comes from the server process's `COWORK_AGENT_ID`, defaulting to `default`; on a mismatch, the controls are disabled and the task row
+provides a copyable `cowork task start <id>` command to run from the owner lane CLI. The panel never fills in or impersonates an owner.
+Dispatch uses FIFO and dependencies; each action runs one CLI subprocess. The result bar shows the raw exit code and output. Sequential repeat dispatch
+returns 1 and the card retains the actual snapshot state.
+The server binds only `127.0.0.1`, stays in the foreground, and stops on Ctrl+C. A busy port exits 3; choose `--port`.
+The startup URL carries a random token, removed after the page reads it. Polling runs every 2s and pauses while hidden.
+The static board remains available with copy-command buttons.
+
 ## Install
 
 Requires **Node ≥ 22.6** and **git ≥ 2.40**. Zero runtime dependencies.
@@ -149,6 +178,8 @@ cowork version
 | `cowork status` / `cowork brief` | Global claim table / this lane's summary |
 | `cowork snapshot --json` | Read-only snapshot for scripts and the board |
 | `cowork ui [--watch]` | Render the single-file board |
+| `cowork ui --serve [--port 7788] [--open]` | Local foreground control panel |
+| `cowork task import <plan.json> [--dry-run] [--ready]` | Validate a plan and create drafts; ready only prints commands |
 | `cowork task add / ready / show / ls` | Create a spec, promote it to ready, inspect the queue |
 | `cowork next` | Atomically claim a ready task (and its files) |
 | `cowork task start / report-done / confirm-merge` | Start -> deliver -> merge |
@@ -194,7 +225,7 @@ The code is plain Node with no native dependencies, but the concurrency primitiv
 
 - No task decomposition, no LLM scheduling, no pushing tasks at agents — whoever works pulls with `cowork next`;
 - No automatic fan-out; parallelism is bounded only by dependencies, `touches`, and claims;
-- No write-side daemon, no Electron, no listening port;
+- No write-side daemon or Electron; only explicit `ui --serve` opens a loopback port;
 - No Docker / WSL, no background processes;
 - No AST-level auto-merge; conflict detection stops at the file level;
 - Never modifies the installation or binaries of Codex, Claude Code, DSH, or any other agent.
@@ -209,11 +240,12 @@ The code is plain Node with no native dependencies, but the concurrency primitiv
 ## Contributing
 
 ```bash
-npm test                              # 109 tests: node:test against real git worktrees
+npm test                              # 132 tests: node:test against real git worktrees
 npx tsc --noEmit                      # type check
 npm run build                         # compile to dist/
 node tools/mutex-gate.mjs             # concurrency gate: 8 processes x 1000 runs, zero overlap
 node tools/accept-m1.mjs --with-build # M1 acceptance (10 checks)
+node tools/accept-panel.mjs          # M1.5 acceptance (13 checks, includes test / tsc)
 ```
 
 The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight from source via `node --experimental-strip-types`. Design docs live in [`docs/`](docs/); handoff notes in [`.cowork/notes/`](.cowork/notes/) — cowork is managed by cowork itself.
@@ -223,6 +255,7 @@ The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight fro
 - [Plan: requirements, constraints, acceptance criteria](docs/PLAN.md)
 - [Architecture: paths, claims, worktrees, failure modes](docs/ARCHITECTURE.md)
 - [Task layer protocol: task object, dispatch, snapshot contract](docs/ARCHITECTURE-TASKS.md)
+- [Control panel: processes, security boundary, API](docs/ARCHITECTURE-PANEL.md)
 - [Decisions, including ones that were overturned and how to reproduce](docs/DECISIONS.md)
 
 ## License

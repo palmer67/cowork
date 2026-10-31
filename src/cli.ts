@@ -25,6 +25,7 @@ import { next } from './tasknext.ts';
 import { doctorTasks } from './taskdoctor.ts';
 import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
+import { importPlan } from './planimport.ts';
 
 /** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
 const KNOWN_COMMANDS = new Set([
@@ -61,6 +62,7 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>
   cowork task block <id> --reason <文本>
   cowork task cancel <id> [--reason <文本>]
+  cowork task import <plan.json> [--dry-run] [--ready]
   cowork brief [--agent <名>]    开工摘要（只读）
   cowork lane new <名> [--base <ref>]
                                   创建车道（git worktree，不持锁）
@@ -580,6 +582,19 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
       const result = await cancelTask(info, needId(), agent, reason);
       console.log(`${result.live.id} → cancelled`);
       for (const display of result.released) console.log(`  已释放占位 ${display}`);
+      return EXIT.OK;
+    }
+    case 'import': {
+      const file = rest[1] ?? '';
+      if (file === '') throw general('task import 需要 plan.json 路径', '例如: cowork task import plan.json');
+      const result = await importPlan(info, path.resolve(process.cwd(), file), { dryRun: args.flags.has('dry-run') });
+      console.log(`${result.dryRun ? '计划将导入' : '导入'} ${result.tasks.length} 个任务（draft）:`);
+      for (const task of result.tasks) console.log(`  ${task.key.padEnd(18)} → ${task.id}`);
+      console.log('依赖:');
+      for (const task of result.tasks) for (const dep of task.depends_on) console.log(`  ${task.id} depends_on ${dep}`);
+      if (result.dryRun) console.log('（dry-run：未写入文件）');
+      else console.log('下一步: git add .cowork/tasks && git commit -m "task: …"，然后 cowork task ready <id>');
+      if (args.flags.has('ready')) for (const task of result.tasks) console.log(`  cowork task ready ${task.id}`);
       return EXIT.OK;
     }
     default:

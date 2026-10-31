@@ -159,24 +159,11 @@ contracts_changed:
 
 被否决的备选：允许 doctor 或 `task done` 自动删除测试产生的文件。否决：这会掩盖验证程序的副作用，并可能删除 agent 尚未提交的诊断材料。
 
-### 8. 可执行验收清单
+### 8. 验收策略
 
-每条都可由临时 Git 仓库、两个 lane 和白名单命令脚本执行：
+选择把状态、claim、HEAD/dirty 和契约提醒都写成可执行验收。理由：M2 的关键安全边界是跨进程状态和退出码，必须能重复证明。
 
-1. `reported_done` 执行 `task done` 后进入 verifying；验证期间另一个 lane 的 `next` 不能抢同一任务或其 touches。
-2. 任一验证命令退出非零时，`task done` 退出 `1`，状态为 `verify_failed`，lease 和全部 claims 仍存在。
-3. 验证后修改 lane HEAD，再让命令返回 `0`，结果必须为 `verify_failed`、退出 `1`，不能进入 awaiting_merge。
-4. 验证前制造 tracked/unstaged 或 untracked dirty，`task done` 拒绝执行并退出 `1`，状态保持 `in_progress`。
-5. squash 场景不带 `--manual` 或缺 `--reason` 的 `confirm-merge` 退出 `1`，状态仍为 awaiting_merge。
-6. `reads` 与其他任务 touches 相交时，`brief`、`next` 和 snapshot 各出现一条结构化契约提醒。
-7. 修正/移除冲突 handoff 后重新生成 snapshot，原契约提醒消失，坏 front matter 则进入 diagnostics。
-8. 验证进程被杀死且 live PID 已失效时，`doctor --fix` 把 verifying 恢复为 reported_done，保留 claim，并记录恢复历史；PID 仍存活时不回退。
-9. snapshot 在 verifying/verify_failed/awaiting_merge 分别显示 verification status、命令记录、exit、duration、head 和 summary。
-10. 普通 merge 的 target 不存在或不满足 `is-ancestor` 时退出 `1`、状态和 claims 不变；满足时才 merged 并释放占位。
-11. rename、delete 和 `src/foo/**` 的契约/reads 命中与 touches matcher 一致，路径段相邻前缀不误报。
-12. 验证命令写入 worktree 后未自清理，结果为 verify_failed；写入系统临时目录且工作树保持 clean 时可进入 awaiting_merge。
-
-被否决的备选：只保留人工走查清单。否决：M2 的关键安全边界是状态、claim 和退出码，必须能由脚本重复证明。
+被否决的备选：只保留人工走查清单。否决：无法稳定复现竞争、恢复和状态保持行为。
 
 ### 9. 非目标
 
@@ -186,6 +173,14 @@ contracts_changed:
 - 不把验证结果当作合并证明；最终 merged 仍需人工确认。
 
 被否决的备选：把 M2 扩展成自动 merge/自动调度系统。否决：这会越过人工确认边界，改变 cowork 作为拉取式纪律层的定位。
+
+## 数据与配置 schema
+
+配置顶层为 `verification`：`allow_disabled: boolean`、非空 `commands: VerificationCommand[]`、固定的 `env_allowlist: string[]`。每个命令包含唯一 `name`、非空 `argv: string[]`、有界 `timeout_ms` 和 `enabled: boolean`；至少一个命令启用。执行记录包含命令名、原始 argv、exit、duration、head、摘要与时间。
+
+task live 的可空 `verification` 记录含 `run_id`、`status`、`pid`、`host`、`started_at`、`finished_at`、`head_before`、`head_after`、summary 和 records；snapshot 对任务投影同一字段，不重算或丢弃历史。`head_before` 即本次验证绑定的 `verify_head`。
+
+handoff `contracts_changed` 是对象数组，每项的 `paths` 是非空字符串数组；old/new/compatibility/affected_tasks 为可选展示字段。缺字段默认为空列表，坏形状进入 handoff diagnostics。snapshot `contract_alerts` 每项含 kind、读方/写方 task 或 lane、path、handoff path 与 summary。
 
 ## 状态机图（纯文本）
 
@@ -224,6 +219,23 @@ doctor --fix
   ├─ lock: verifying -> reported_done，保留 lease/claims，追加 recovery history
   └─ unlock
 ```
+
+## 验收清单
+
+每条都可由临时 Git 仓库、两个 lane 和白名单命令脚本执行：
+
+1. `reported_done` 执行 `task done` 后进入 verifying；验证期间另一个 lane 的 `next` 不能抢同一任务或其 touches。
+2. 任一验证命令退出非零时，`task done` 退出 `1`，状态为 `verify_failed`，lease 和全部 claims 仍存在。
+3. 验证后修改 lane HEAD，再让命令返回 `0`，结果必须为 `verify_failed`、退出 `1`，不能进入 awaiting_merge。
+4. 验证前制造 tracked/unstaged 或 untracked dirty，`task done` 拒绝执行并退出 `1`，状态保持 `in_progress`。
+5. squash 场景不带 `--manual` 或缺 `--reason` 的 `confirm-merge` 退出 `1`，状态仍为 awaiting_merge。
+6. `reads` 与其他任务 touches 相交时，`brief`、`next` 和 snapshot 各出现一条结构化契约提醒。
+7. 修正/移除冲突 handoff 后重新生成 snapshot，原契约提醒消失，坏 front matter 则进入 diagnostics。
+8. 验证进程被杀死且 live PID 已失效时，`doctor --fix` 把 verifying 恢复为 reported_done，保留 claim，并记录恢复历史；PID 仍存活时不回退。
+9. snapshot 在 verifying/verify_failed/awaiting_merge 分别显示 verification status、命令记录、exit、duration、head 和 summary。
+10. 普通 merge 的 target 不存在或不满足 `is-ancestor` 时退出 `1`、状态和 claims 不变；满足时才 merged 并释放占位。
+11. rename、delete 和 `src/foo/**` 的契约/reads 命中与 touches matcher 一致，路径段相邻前缀不误报。
+12. 验证命令写入 worktree 后未自清理，结果为 verify_failed；写入系统临时目录且工作树保持 clean 时可进入 awaiting_merge。
 
 ## 需要判官裁定的问题
 

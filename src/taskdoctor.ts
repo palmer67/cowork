@@ -1,4 +1,4 @@
-import { mkdirSync, renameSync } from 'node:fs';
+import { lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { isExpired } from './claims.ts';
 import { gitTry, type RepoInfo } from './git.ts';
@@ -18,9 +18,13 @@ export interface TaskDoctorReport {
   problems: string[];
   /** --fix 本次实际修好的项。 */
   fixed: string[];
+  /** 可清理但不影响退出码的提示。 */
+  notices: string[];
 }
 
 const LEASE_STATUSES = new Set(['claimed', 'in_progress']);
+const LOCK_TMP_MAX_AGE_MS = 60_000;
+const TRASH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function describeProblem(file: string, issue: string, fix: string): string {
   return `${file}: ${issue}；${fix}`;
@@ -82,6 +86,48 @@ function specProblems(catalog: TaskCatalog): string[] {
   return problems;
 }
 
+interface StaleArtifact {
+  path: string;
+  kind: 'lock.tmp' | 'trash';
+}
+
+function staleArtifacts(state: string, now = Date.now()): StaleArtifact[] {
+  const found: StaleArtifact[] = [];
+  let entries;
+  try {
+    entries = readdirSync(state, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return found;
+    return found;
+  }
+  for (const entry of entries) {
+    if (!entry.name.startsWith('lock.tmp-')) continue;
+    const item = path.join(state, entry.name);
+    try {
+      if (now - lstatSync(item).mtimeMs > LOCK_TMP_MAX_AGE_MS) found.push({ path: item, kind: 'lock.tmp' });
+    } catch {
+      // Another doctor may remove the item after enumeration.
+    }
+  }
+
+  let trashEntries;
+  try {
+    trashEntries = readdirSync(path.join(state, 'trash'), { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return found;
+    return found;
+  }
+  for (const entry of trashEntries) {
+    const item = path.join(state, 'trash', entry.name);
+    try {
+      if (now - lstatSync(item).mtimeMs > TRASH_MAX_AGE_MS) found.push({ path: item, kind: 'trash' });
+    } catch {
+      // Another doctor may remove the item after enumeration.
+    }
+  }
+  return found;
+}
+
 /** --fix 的所有写操作；调用方必须在全局锁内执行。 */
 function fixPass(info: RepoInfo, state: string, catalog: TaskCatalog, fixed: string[]): void {
   const intents = listIntents(state);
@@ -136,6 +182,15 @@ function fixPass(info: RepoInfo, state: string, catalog: TaskCatalog, fixed: str
     });
     fixed.push(`已回收过期 lease ${live.id}（${catalog.trunk}）`);
   }
+
+  for (const artifact of staleArtifacts(state)) {
+    try {
+      rmSync(artifact.path, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      fixed.push(`已删除${artifact.kind === 'lock.tmp' ? '锁临时目录' : 'trash 残留'} ${artifact.path}`);
+    } catch {
+      // Leave failures visible as notices on the follow-up read.
+    }
+  }
 }
 
 /** 只读检查（--fix 时先修再查）。返回 problems 非空即 doctor 退出 1。 */
@@ -160,5 +215,8 @@ export async function doctorTasks(info: RepoInfo, fix: boolean): Promise<TaskDoc
       describeProblem(item.file, `残留未完成 next 事务（${item.intent.task_id}）`, 'cowork doctor --fix 回滚，或重新运行 cowork next'),
     );
   }
-  return { problems, fixed };
+  const notices = staleArtifacts(state).map((artifact) =>
+    `${artifact.path}: ${artifact.kind === 'lock.tmp' ? '超过 60 秒的锁临时目录' : '超过 24 小时的 trash 条目'}；运行 cowork doctor --fix 清理`,
+  );
+  return { problems, fixed, notices };
 }

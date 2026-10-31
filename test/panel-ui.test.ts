@@ -66,4 +66,10 @@ test('按状态与 owner 禁用动作；ready/confirm-merge 不受 owner 限制'
   assert.doesNotMatch(actionMarkup(board, 't-merge01', 'confirm-merge'), /\sdisabled(?:\s|>)/);
   const matching = renderBoard({ ...snap, panel_agent: 'dsh', tasks: [ownedTask('t-owned01', 'claimed')] }, { serve: true });
   assert.doesNotMatch(actionMarkup(matching, 't-owned01', 'start'), /\sdisabled(?:\s|>)/);
+  const mainOwner = renderBoard({ ...snap, panel_agent: 'panel-operator', tasks: [{ ...snap.tasks[0]!, id: 't-main01', status: 'claimed', assigned_lane: null, agent: 'main-agent' }] }, { serve: true });
+  assert.match(mainOwner, /\(main\)/);
+  assert.match(actionMarkup(mainOwner, 't-main01', 'start'), /disabled title="需在车道 \(main\) 内由 main-agent 执行"/);
+  const undeclared = renderBoard({ ...snap, panel_agent: 'panel-operator', tasks: [{ ...snap.tasks[0]!, id: 't-undecl', status: 'claimed', assigned_lane: 'dsh', agent: null }] }, { serve: true });
+  assert.match(undeclared, /未声明/);
+  assert.match(actionMarkup(undeclared, 't-undecl', 'start'), /disabled title="需在车道 dsh 内由 未声明 执行"/);
 });

@@ -152,9 +152,27 @@ try {
   const live = JSON.parse(execFileSync('node', ['-e', `const fs=require('fs');const p=process.argv[1];process.stdout.write(fs.readFileSync(p,'utf8'))`, path.join(root, '.git', 'cowork', 'tasks', `${id}.json`)], { encoding: 'utf8' }));
   check('live 状态 claimed 且归属 dsh', live.status === 'claimed' && live.lane === 'dsh' && live.agent === 'dsh', JSON.stringify({ status: live.status, lane: live.lane, agent: live.agent }));
 
-  // ---- 派工后从面板点「开始」----
+  // ---- R4：面板身份与任务 owner 不符时，状态按钮必须置灰并给提示 ----
+  const snapAfter = await api('/api/snapshot');
+  check('快照带 panel_agent=default', snapAfter.data?.panel_agent === 'default', JSON.stringify(snapAfter.data?.panel_agent));
+  const homeHtml = (await api(`/?t=${token}`)).text;
+  const startBtn = homeHtml.match(new RegExp(`<button[^>]*data-api="/api/task/${id}/start"[^>]*>`));
+  check('已派工任务渲染出 start 按钮', Boolean(startBtn), startBtn ? 'found' : 'missing');
+  check(
+    'start 按钮置灰且写明需在车道 dsh 内由 dsh 执行',
+    Boolean(startBtn && /\bdisabled\b/.test(startBtn[0]) && startBtn[0].includes('需在车道 dsh 内由 dsh 执行')),
+    startBtn ? startBtn[0] : '',
+  );
+  const mergeBtn = homeHtml.match(new RegExp(`<button[^>]*data-api="/api/task/${id}/confirm-merge"[^>]*>`));
+  check(
+    'confirm-merge 不因 owner 规则置灰（只因状态未到）',
+    Boolean(mergeBtn && !mergeBtn[0].includes('需在车道')),
+    mergeBtn ? mergeBtn[0] : 'missing',
+  );
+  check('置灰任务给出可复制的 cowork task start 命令', homeHtml.includes(`cowork task start ${id}`), '');
+  // UI 只是前置拦截，后端仍然必须拒绝
   const started = await api(`/api/task/${id}/start`, { method: 'POST', body: {} });
-  note('面板点「开始」', `code=${started.data?.code} stderr=${String(started.data?.stderr ?? '').split('\n')[0]}`);
+  check('绕过 UI 直接 POST start 仍被任务 owner 拒绝', started.data?.code === 2, JSON.stringify(started.data));
 
   // ---- 队列顺序重复派工（R1）----
   const again = await api('/api/lane/dsh/next', { method: 'POST', body: {} });

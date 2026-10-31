@@ -9,6 +9,7 @@ import { claimId, listClaims, readClaim, removeClaim, stateRoot } from './store.
 import {
   listTaskLiveStates,
   readTaskLive,
+  transitionM2Task,
   transitionTask,
   type TaskLiveStates,
   type LiveStatus,
@@ -294,45 +295,78 @@ export interface MergeResult {
   released: string[];
 }
 
-/** reported_done → merged；释放 lease 与全部 touches claim。M1 只接受 --manual。 */
+/** awaiting_merge → merged；释放 lease 与全部 touches claim。 */
 export async function confirmMerge(
   info: RepoInfo,
   id: string,
   options: { commit: string; manual: boolean; reason: string | null },
 ): Promise<MergeResult> {
+  const state = stateRoot(info);
+  const observed = readTaskLive(state, id);
+  if (observed === null) {
+    throw general(`找不到任务: ${id}`, '运行 cowork task ls 查看有效任务 id。');
+  }
+  if (observed.status === 'reported_done') {
+    throw general('尚未验证，请先 task done', `运行 cowork task done ${id}；验证通过后再确认合并。`);
+  }
+  if (observed.status !== 'awaiting_merge') {
+    throw general(
+      `任务当前状态不能 confirm-merge: ${id} → ${observed.status}`,
+      'confirm-merge 只适用于 awaiting_merge；先运行 cowork task done 完成验证。',
+    );
+  }
+  const verification = observed.verification;
+  if (verification?.status !== 'passed' || verification.head_before === null) {
+    throw general('任务缺少有效的通过验证记录', '运行 cowork task show 确认 live；必要时由 owner 重新运行 cowork task done。');
+  }
   if (options.commit.trim() === '') {
     throw general('confirm-merge 需要 --commit <sha>', '先合并任务分支，再用合并提交的 sha 确认。');
   }
-  if (!options.manual) {
-    throw general(
-      'M1 没有自动验证，请加 --manual 并给出 --reason',
-      'M2 才有 verifying / verify_failed；M1 用 cowork task confirm-merge <id> --commit <sha> --manual --reason "..."。',
-    );
-  }
   const reason = options.reason?.trim() ?? '';
-  if (reason === '') {
+  if (options.manual && reason === '') {
     throw general('--manual 需要 --reason <文本>', '写清人工确认的依据（谁验的、验了什么）。');
   }
   const sha = gitTry(['rev-parse', '--verify', `${options.commit}^{commit}`], info.mainRoot);
   if (sha === null) {
     throw general(`无法解析合并提交: ${options.commit}`, '确认 sha 在当前仓库可见（至少一个分支或 FETCH_HEAD 包含它）。');
   }
+  if (!options.manual && gitTry(['merge-base', '--is-ancestor', verification.head_before, sha], info.mainRoot) === null) {
+    throw general(
+      `合并目标未包含已验证提交 ${verification.head_before.slice(0, 7)}；非祖先目标需显式 --manual --reason`,
+      '普通合并必须保留验证提交；若已 squash/cherry-pick，请显式附上 --manual --reason "..."。',
+    );
+  }
   const catalog = readTrunkCatalog(info);
   const spec = findSpec(info, catalog, id);
   return withTaskLock(info, (state) => {
     const live = requireLive(state, id);
-    if (live.status !== 'reported_done') {
+    if (live.status === 'reported_done') {
+      throw general('尚未验证，请先 task done', `运行 cowork task done ${id}；验证通过后再确认合并。`);
+    }
+    if (live.status !== 'awaiting_merge') {
       throw general(
         `任务当前状态不能 confirm-merge: ${id} → ${live.status}`,
-        'confirm-merge 只适用于 reported_done；先 cowork task report-done。',
+        'confirm-merge 只适用于 awaiting_merge；先运行 cowork task done 完成验证。',
       );
     }
-    const merged = transitionTask(state, id, 'merged', {
+    if (
+      live.verification?.status !== 'passed' ||
+      live.verification.run_id !== verification.run_id ||
+      live.verification.head_before !== verification.head_before
+    ) {
+      throw busy('验证记录在确认合并期间已变化', '重新运行 cowork task show 并核对当前 awaiting_merge 验证记录。');
+    }
+    const operator = agentId();
+    const confirmation = options.manual
+      ? `人工确认：${reason}`
+      : `包含验证提交 ${verification.head_before}`;
+    const merged = transitionM2Task(state, id, 'merged', {
       lane: null,
       lanePath: null,
       agent: null,
+      historyAgent: operator,
       specCommit: spec.specCommit ?? live.spec_commit,
-      note: `merged ${sha.slice(0, 7)}（人工确认：${reason}）`,
+      note: `merged ${sha.slice(0, 7)}（${confirmation}；operator=${operator}）`,
     });
     const released = releaseTaskClaims(info, state, spec);
     return { live: merged, released };

@@ -62,7 +62,7 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
                                   领取一个 ready 任务（FIFO；崩溃事务可恢复）
   cowork task start|report-done <id>
   cowork task done <id>           执行 trunk 配置的自动验证
-  cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>
+  cowork task confirm-merge <id> --commit <sha> [--manual --reason <文本>]
   cowork task block <id> --reason <文本>
   cowork task cancel <id> [--reason <文本>]
   cowork task import <plan.json> [--dry-run] [--ready]

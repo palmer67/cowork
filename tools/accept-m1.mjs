@@ -332,6 +332,15 @@ def(6, 'snapshot 显示 ready 与 spec_commit', () => {
 // 7. 依赖只认 merged
 def(7, '依赖只认 merged（reported_done 不解锁）', () => {
   const root = newRepo();
+  const configPath = path.join(root, '.cowork', 'config.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  config.verification = {
+    allow_disabled: false,
+    commands: [{ name: 'accept', argv: [process.execPath, '-e', 'process.exit(0)'], timeout_ms: 5000, enabled: true }],
+    env_allowlist: ['PATH', 'SystemRoot', 'ComSpec', 'TEMP', 'TMP', 'COWORK_AGENT_ID'],
+  };
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  commitAll(root, 'configure verification');
   const a = lane(root, 'a');
   const b = lane(root, 'b');
   const { check, done } = makeChecker();
@@ -347,6 +356,8 @@ def(7, '依赖只认 merged（reported_done 不解锁）', () => {
   check(gotA.code === 0 && gotA.out.includes(A.id), `车道 a 应领到 A：${gotA.out.trim().slice(0, 200)}`);
   check(cw(a, ['task', 'start', A.id], 'a').code === 0, 'A start 失败');
   check(cw(a, ['task', 'report-done', A.id], 'a').code === 0, 'A report-done 失败');
+  const verified = cw(a, ['task', 'done', A.id], 'a');
+  check(verified.code === 0, `A task done 验证失败：${verified.out.trim().slice(0, 200)}`);
 
   const blocked = cw(b, ['next'], 'b');
   check(blocked.code === 1, `A 只到 reported_done 时 B 应不可领（exit 1），实际 ${blocked.code}`);

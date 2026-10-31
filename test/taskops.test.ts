@@ -9,7 +9,7 @@ import { CoworkError, EXIT } from '../src/errors.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
 import { parseClaim } from '../src/paths.ts';
 import { claimId, ensureState, listClaims, stateRoot, writeClaim } from '../src/store.ts';
-import { readTaskLive, transitionTask } from '../src/taskstore.ts';
+import { readTaskLive, transitionM2Task, transitionTask, type VerificationLive } from '../src/taskstore.ts';
 import { readTrunkCatalog } from '../src/tasks.ts';
 import {
   addTask,
@@ -91,6 +91,21 @@ function makeRepo(specs: Record<string, unknown>[]): Fixture {
 function markReady(fixture: Fixture, ids: readonly string[]): void {
   ensureState(fixture.state);
   for (const id of ids) transitionTask(fixture.state, id, 'ready');
+}
+
+function markAwaitingMerge(fixture: Fixture, id: string, agent: string, head = git(['rev-parse', 'HEAD'], fixture.root)): void {
+  const verification: VerificationLive = {
+    run_id: `verify-${id}`, status: 'running', pid: null, host: null,
+    pid_started_at: null, pid_start_error: null,
+    started_at: new Date().toISOString(), finished_at: null,
+    head_before: head, head_after: null, config_commit: head,
+    summary: '', records: [],
+  };
+  transitionM2Task(fixture.state, id, 'verifying', { agent, verification });
+  transitionM2Task(fixture.state, id, 'awaiting_merge', {
+    agent,
+    verification: { ...verification, status: 'passed', finished_at: new Date().toISOString() },
+  });
 }
 
 async function expectCode(fn: () => Promise<unknown>, code: number): Promise<CoworkError> {
@@ -283,7 +298,7 @@ test('start / report-done / block 检查状态与持有者', async () => {
   }
 });
 
-test('confirm-merge 要求 --manual + --reason，合并后释放占位', async () => {
+test('confirm-merge 对非祖先目标要求 --manual + --reason，合并后释放占位', async () => {
   const fixture = makeRepo([ALPHA]);
   try {
     markReady(fixture, ['t-00a1b2']);
@@ -292,12 +307,23 @@ test('confirm-merge 要求 --manual + --reason，合并后释放占位', async (
     await reportDone(fixture.info, 't-00a1b2', 'alice');
     assert.equal(listClaims(fixture.state).length, 1);
 
-    const sha = git(['rev-parse', 'HEAD'], fixture.root);
+    const targetSha = git(['rev-parse', 'HEAD'], fixture.root);
+    git(['checkout', '-b', 'verified'], fixture.root);
+    writeFileSync(path.join(fixture.root, 'verified.txt'), 'verified branch\n', 'utf8');
+    git(['add', '.'], fixture.root);
+    git(['commit', '-qm', 'verification commit'], fixture.root);
+    const verifyHead = git(['rev-parse', 'HEAD'], fixture.root);
+    git(['checkout', 'main'], fixture.root);
+    markAwaitingMerge(fixture, 't-00a1b2', 'alice', verifyHead);
+
+    const sha = targetSha;
     const noManual = await expectCode(
       () => confirmMerge(fixture.info, 't-00a1b2', { commit: sha, manual: false, reason: 'ok' }),
       EXIT.GENERAL,
     );
     assert.match(noManual.message, /--manual/);
+    assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'awaiting_merge');
+    assert.equal(listClaims(fixture.state).length, 1);
 
     const noReason = await expectCode(
       () => confirmMerge(fixture.info, 't-00a1b2', { commit: sha, manual: true, reason: ' ' }),
@@ -467,6 +493,7 @@ test('e2e: add → ready → next → start → report-done → confirm-merge �
 
     await startTask(fixture.info, first.id, 'alice');
     await reportDone(fixture.info, first.id, 'alice');
+    markAwaitingMerge(fixture, first.id, 'alice');
     const sha = git(['rev-parse', 'HEAD'], fixture.root);
     await confirmMerge(fixture.info, first.id, { commit: sha, manual: true, reason: '人工验收' });
 
@@ -485,6 +512,7 @@ test('confirm-merge 只释放本任务的占位，不误删已接管的 claim', 
     await next(fixture.info, { agent: 'alice', lane: 'alpha', lanePath: fixture.info.laneTop });
     await startTask(fixture.info, 't-00a1b2', 'alice');
     await reportDone(fixture.info, 't-00a1b2', 'alice');
+    markAwaitingMerge(fixture, 't-00a1b2', 'alice');
 
     // 模拟本任务的占位过期后，同一路径被另一个任务接管。
     const owned = parseClaim('src/alpha/**', fixture.info);
@@ -526,7 +554,6 @@ test('M2 状态可阻塞后继续，或重新就绪并释放占位', async () =>
     await startTask(fixture.info, 't-00a1b2', 'alice');
     await reportDone(fixture.info, 't-00a1b2', 'alice');
     markAwaitingMerge(fixture, 't-00a1b2', 'alice');
-
     const blocked = await blockTask(fixture.info, 't-00a1b2', 'alice', '等待依赖确认');
     assert.equal(blocked.status, 'blocked');
     assert.equal(blocked.blocked_reason, '等待依赖确认');
@@ -543,6 +570,48 @@ test('M2 状态可阻塞后继续，或重新就绪并释放占位', async () =>
     assert.equal(readied.status, 'ready');
     assert.equal(readied.lane, null);
     assert.equal(readied.agent, null);
+    assert.equal(listClaims(fixture.state).length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('reported_done 直接 confirm-merge 拒绝且不释放占位', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    await next(fixture.info, { agent: 'alice', lane: 'alpha', lanePath: fixture.info.laneTop });
+    await startTask(fixture.info, 't-00a1b2', 'alice');
+    await reportDone(fixture.info, 't-00a1b2', 'alice');
+    const sha = git(['rev-parse', 'HEAD'], fixture.root);
+
+    const err = await expectCode(
+      () => confirmMerge(fixture.info, 't-00a1b2', { commit: sha, manual: true, reason: '验收绕过尝试' }),
+      EXIT.GENERAL,
+    );
+    assert.match(err.message, /尚未验证，请先 task done/);
+    assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'reported_done');
+    assert.equal(listClaims(fixture.state).length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('awaiting_merge 的验证提交是 target 祖先时可普通确认合并', async () => {
+  const fixture = makeRepo([ALPHA]);
+  try {
+    markReady(fixture, ['t-00a1b2']);
+    await next(fixture.info, { agent: 'alice', lane: 'alpha', lanePath: fixture.info.laneTop });
+    await startTask(fixture.info, 't-00a1b2', 'alice');
+    await reportDone(fixture.info, 't-00a1b2', 'alice');
+    markAwaitingMerge(fixture, 't-00a1b2', 'alice');
+    const sha = git(['rev-parse', 'HEAD'], fixture.root);
+
+    const result = await confirmMerge(fixture.info, 't-00a1b2', { commit: sha, manual: false, reason: null });
+    assert.equal(result.live.status, 'merged');
+    assert.match(result.live.history.at(-1)?.note ?? '', /包含验证提交/);
+    assert.ok(Date.parse(result.live.history.at(-1)?.at ?? '') > 0);
+    assert.ok(result.live.history.at(-1)?.agent);
     assert.equal(listClaims(fixture.state).length, 0);
   } finally {
     fixture.cleanup();

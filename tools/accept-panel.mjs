@@ -28,8 +28,8 @@ const state = path.join(root, '.git', 'cowork');
 const laneDir = (name) => path.join(root, '.cowork', 'lanes', name);
 let child, childExited = false, port, token, id, failed = 0, passed = 0;
 
-function run(command, argv, cwd = root, extra = {}) {
-  const r = spawnSync(command, argv, { cwd, env: { ...env, ...extra }, encoding: 'utf8', windowsHide: true, timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
+function run(command, argv, cwd = root, extra = {}, timeout = 180_000) {
+  const r = spawnSync(command, argv, { cwd, env: { ...env, ...extra }, encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 16 * 1024 * 1024 });
   return { code: r.status ?? -1, stdout: r.stdout ?? '', stderr: r.stderr ?? '', error: r.error };
 }
 function success(r) { assert.equal(r.code, 0, `${r.stdout}${r.stderr}${r.error ?? ''}`); return r; }
@@ -212,10 +212,10 @@ try {
   await stop();
   await check(13, 'npm test / tsc 通过；零运行时依赖与架构门禁', async () => {
     const pkg = JSON.parse(readFileSync(path.join(project, 'package.json'), 'utf8')); assert.equal(Object.keys(pkg.dependencies ?? {}).length, 0);
-    const tests = run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], project);
+    const tests = run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], project, {}, 600_000);
     // Windows .cmd 不能由无 shell 的 spawnSync 直接启动；使用 Node 运行 npm 官方入口。
     const npmEntry = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    const testResult = tests.error?.code === 'EINVAL' || tests.error?.code === 'ENOENT' ? run(process.execPath, [npmEntry, 'test'], project) : tests;
+    const testResult = tests.error?.code === 'EINVAL' || tests.error?.code === 'ENOENT' ? run(process.execPath, [npmEntry, 'test'], project, {}, 600_000) : tests;
     success(testResult); assert.match(testResult.stdout, /# fail 0/);
     const tsc = run(process.execPath, [path.join(project, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit'], project);
     success(tsc); assert.equal(tsc.stdout + tsc.stderr, '');

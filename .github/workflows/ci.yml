@@ -1,9 +1,16 @@
 name: ci
 
 on:
-  # 任意分支的 push 都跑门禁：实现方在自己的车道分支上就能看到红绿
+  # main 与 agent 车道分支的 push 跑门禁：实现方在自己的分支上就能看到红绿，main 始终有基线
+  # 纯文档/数据提交不跑（paths-ignore 只在"本次改动全部命中"时生效），避免白烧 runner 分钟
   push:
+    branches: [main, 'dsh/**', 'codex/**']
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.cowork/**'
   pull_request:
+    branches: [main]
   workflow_dispatch:
   schedule:
     # 每周一 03:17 UTC（北京时间 11:17）跑一次压测，抓偶发竞态

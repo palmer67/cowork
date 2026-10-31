@@ -5,7 +5,7 @@
 //
 // M2 尚未实现时，本脚本不会报一堆 FAIL，而是先探测能力，缺能力就整段 SKIP 并说明原因。
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { tmpdir, hostname } from 'node:os';
 import path from 'node:path';
 
@@ -62,6 +62,7 @@ const VERIFY_SCRIPTS = {
   'v-dirty.js': "const { writeFileSync } = require('node:fs'); writeFileSync('probe-side-effect.txt', 'x'); process.exit(0);\n",
   'v-slow.js': 'setTimeout(() => process.exit(0), 5000);\n',
   'v-slow-pass.js': 'setTimeout(() => process.exit(0), 4000);\n',
+  'v-noisy.js': "process.stdout.write('x'.repeat(5000)); process.exit(0);\n",
 };
 
 /**
@@ -94,6 +95,9 @@ function initRepo() {
   writeFileSync(path.join(root, 'src', 'foo', 'a.ts'), 'export const a = 1;\n');
   writeFileSync(path.join(root, 'src', 'foo', 'bar', 'b.ts'), 'export const b = 1;\n');
   writeFileSync(path.join(root, 'src', 'foobar.ts'), 'export const fb = 1;\n');
+  for (let i = 1; i <= 7; i += 1) writeFileSync(path.join(root, 'src', `p${i}.ts`), `export const p${i} = 1;\n`);
+  writeFileSync(path.join(root, 'src', 'p10.ts'), 'export const p10 = 1;\n');
+  writeFileSync(path.join(root, 'src', 'capability.ts'), 'export const cap = 1;\n');
   writeFileSync(path.join(root, 'README.md'), '# probe m2\n');
   git(['add', '-A'], root);
   git(['commit', '-q', '-m', 'init'], root);
@@ -124,6 +128,9 @@ function readyTask(title, touches, laneName) {
   const n = run(['next'], laneDir, true);
   if (n.code !== 0) throw new Error(`next 失败: ${n.stdout}${n.stderr}`);
   run(['task', 'start', id], laneDir, true);
+  // M2 只允许从 reported_done 进入验证；start 之后必须先 report-done。
+  const rd = run(['task', 'report-done', id], laneDir, true);
+  if (rd.code !== 0) throw new Error(`task report-done 失败: ${rd.stdout}${rd.stderr}`);
   return { id, laneDir };
 }
 
@@ -133,10 +140,30 @@ function readLive(id) {
   return existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null;
 }
 
+
+/** 读 claims 目录里属于本任务的占位（M1/M2 的 claims 不在 live 内） */
+function claimsOf(id) {
+  const common = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: root, encoding: 'utf8' }).trim();
+  const dir = path.join(common, 'cowork', 'claims');
+  if (!existsSync(dir)) return [];
+  const out = [];
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.json')) continue;
+    try {
+      const rec = JSON.parse(readFileSync(path.join(dir, name), 'utf8'));
+      if (rec?.note === `task ${id}`) out.push(rec);
+    } catch {
+      // 坏文件由 doctor 负责，探针只数自己的占位
+    }
+  }
+  return out;
+}
+
+
 // ---- 能力探测 -------------------------------------------------------------
 
 function hasM2() {
-  const add = run(['task', 'add', '--title', '能力探测', '--touches', 'src/api.ts', '--done-when', 'probe'], root, true);
+  const add = run(['task', 'add', '--title', '能力探测', '--touches', 'src/capability.ts', '--done-when', 'probe'], root, true);
   const id = /t-[0-9a-f]{6}/.exec(add.stdout)?.[0];
   if (id === undefined) return { ok: false, why: 'task add 不可用' };
   git(['add', '.cowork/tasks'], root);
@@ -147,8 +174,12 @@ function hasM2() {
   const laneDir = path.join(root, '.cowork', 'lanes', 'probe-m2');
   run(['next'], laneDir, true);
   run(['task', 'start', id], laneDir, true);
+  const report = run(['task', 'report-done', id], laneDir, true);
+  if (report.code !== 0) return { ok: false, why: `report-done 失败: ${report.stdout}${report.stderr}` };
   const done = run(['task', 'done', id], laneDir, true);
   if (done.code === 0 || /verifying|verify_failed|awaiting_merge/.test(done.stdout + done.stderr)) return { ok: true, id, laneDir };
+  // M2 已实现、只是仓库还没配 verification：这就是实现存在的证据。
+  if (/trunk 验证配置缺失|验证配置格式错误/.test(done.stdout + done.stderr)) return { ok: true, id, laneDir };
   return { ok: false, why: `task done 未进入 M2 流程: code=${done.code} ${(done.stdout + done.stderr).trim().slice(0, 200)}` };
 }
 
@@ -169,7 +200,7 @@ try {
   // P1 验证期间不阻塞别的车道 + 状态不共享
   {
     writeConfig(root, [{ name: 'slow', argv: nodeArgv('v-slow-pass.js'), timeout_ms: 60000 }]);
-    const { id, laneDir } = readyTask('P1 慢验证', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P1 慢验证', ['src/p1.ts'], 'probe-m2');
     const child = spawn(process.execPath, [cli, 'task', 'done', id], { cwd: laneDir, windowsHide: true });
     let finished = false;
     const t0 = Date.now();
@@ -192,19 +223,19 @@ try {
   // P2 失败 → verify_failed 且保留占位
   {
     writeConfig(root, [{ name: 'fail', argv: nodeArgv('v-fail.js'), timeout_ms: 60000 }]);
-    const { id, laneDir } = readyTask('P2 失败', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P2 失败', ['src/p2.ts'], 'probe-m2');
     const r = run(['task', 'done', id], laneDir, true);
     const live = readLive(id);
     check('P2 失败退出 1', r.code === 1, `实际 ${r.code}`);
     check('P2 状态为 verify_failed', live?.status === 'verify_failed', `实际 ${live?.status}`);
-    check('P2 保留 lease 与 claims', live?.lane === 'probe-m2' && Array.isArray(live?.claims) && live.claims.length === 1, JSON.stringify(live?.claims));
+    check('P2 保留 lease 与 claims', live?.lane === 'probe-m2' && claimsOf(id).length === 1, `claims=${JSON.stringify(claimsOf(id).map((c) => c.path))}`);
     check('P2 verification.records 记录失败', (live?.verification?.records ?? []).some((x) => x.exit !== 0), JSON.stringify(live?.verification?.records));
   }
 
   // P3 验证后 HEAD 漂移
   {
     writeConfig(root, [{ name: 'tamper', argv: nodeArgv('v-pass.js'), timeout_ms: 60000 }]);
-    const { id, laneDir } = readyTask('P3 HEAD 漂移', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P3 HEAD 漂移', ['src/p3.ts'], 'probe-m2');
     const child = spawn(process.execPath, [cli, 'task', 'done', id], { cwd: laneDir, windowsHide: true });
     await sleep(400);
     writeFileSync(path.join(laneDir, 'tamper.txt'), 'x\n');
@@ -218,19 +249,20 @@ try {
 
   // P4 初始 dirty 拒绝
   {
-    const { id, laneDir } = readyTask('P4 dirty', ['src/api.ts'], 'probe-m2');
-    writeFileSync(path.join(laneDir, 'src', 'api.ts'), 'export const api = 2;\n');
+    const { id, laneDir } = readyTask('P4 dirty', ['src/p4.ts'], 'probe-m2');
+    writeFileSync(path.join(laneDir, 'src', 'p4.ts'), 'export const p4 = 2;\n');
     const r = run(['task', 'done', id], laneDir, true);
     const live = readLive(id);
     check('P4 dirty 拒绝且退出 1', r.code === 1, `实际 ${r.code}`);
-    check('P4 状态保持 in_progress', live?.status === 'in_progress', `实际 ${live?.status}`);
-    git(['checkout', '--', 'src/api.ts'], laneDir);
+    check('P4 状态保持 reported_done', live?.status === 'reported_done', `实际 ${live?.status}`);
+    git(['checkout', '--', 'src/p4.ts'], laneDir);
+    git(['status', '--porcelain'], laneDir);
   }
 
   // P5 超时
   {
     writeConfig(root, [{ name: 'slow', argv: nodeArgv('v-slow.js'), timeout_ms: 1500 }]);
-    const { id, laneDir } = readyTask('P5 超时', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P5 超时', ['src/p5.ts'], 'probe-m2');
     const r = run(['task', 'done', id], laneDir, true);
     const live = readLive(id);
     const rec = (live?.verification?.records ?? [])[0];
@@ -242,7 +274,7 @@ try {
   // P6 重复 done
   {
     writeConfig(root, [{ name: 'slow', argv: nodeArgv('v-slow-pass.js'), timeout_ms: 60000 }]);
-    const { id, laneDir } = readyTask('P6 重复 done', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P6 重复 done', ['src/p6.ts'], 'probe-m2');
     const child = spawn(process.execPath, [cli, 'task', 'done', id], { cwd: laneDir, windowsHide: true });
     await sleep(600);
     const again = run(['task', 'done', id], laneDir, true);
@@ -253,13 +285,13 @@ try {
   // P7 成功 → awaiting_merge → confirm-merge
   {
     writeConfig(root, [{ name: 'pass', argv: nodeArgv('v-pass.js'), timeout_ms: 60000 }]);
-    const { id, laneDir } = readyTask('P7 成功', ['src/api.ts'], 'probe-m2');
+    const { id, laneDir } = readyTask('P7 成功', ['src/p7.ts'], 'probe-m2');
     const r = run(['task', 'done', id], laneDir, true);
     const live = readLive(id);
     check('P7 成功退出 0', r.code === 0, `实际 ${r.code}`);
     check('P7 状态 awaiting_merge', live?.status === 'awaiting_merge', `实际 ${live?.status}`);
     const head = git(['rev-parse', 'HEAD'], laneDir);
-    const merge = run(['confirm-merge', id, '--commit', head, '--manual', '--reason', 'probe'], root, true);
+    const merge = run(['task', 'confirm-merge', id, '--commit', head, '--manual', '--reason', 'probe'], root, true);
     check('P7 confirm-merge 成功', merge.code === 0, `实际 ${merge.code} ${merge.stdout}${merge.stderr}`);
   }
 
@@ -284,6 +316,10 @@ try {
     if (aid === undefined || bid === undefined) {
       skip('P9 契约提醒', 'task add 不支持 --reads');
     } else {
+      git(['add', '.cowork/tasks'], root);
+      git(['commit', '-q', '-m', 'task: P9'], root);
+      run(['task', 'ready', aid], root, true);
+      run(['task', 'ready', bid], root, true);
       const snap = run(['snapshot', '--json'], root, true).stdout;
       const alerts = JSON.parse(snap)?.contract_alerts ?? [];
       check('P9 snapshot 出现结构化契约提醒', alerts.some((x) => x.kind && x.path === 'src/api.ts'), JSON.stringify(alerts).slice(0, 200));
@@ -297,20 +333,20 @@ try {
     }
   }
 
-  // P10 doctor 恢复崩溃的验证
+  // P10 doctor 恢复崩溃的验证（真崩溃：CLI 在验证中被杀，verifying 残留）
   {
-    const { id } = readyTask('P10 崩溃恢复', ['src/foobar.ts'], 'probe-m2');
-    const live = readLive(id);
-    if (live === null) throw new Error('P10 读不到 live');
-    const dead = spawnSync(process.execPath, ['-e', 'process.exit(0)']);
-    live.status = 'verifying';
-    live.verification = { run_id: 'probe-run', status: 'running', pid: dead.pid ?? 999999, host: hostname(), started_at: new Date().toISOString(), head_before: git(['rev-parse', 'HEAD'], root), records: [] };
-    const common = execFileSync('git', ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: root, encoding: 'utf8' }).trim();
-    writeFileSync(path.join(common, 'cowork', 'tasks', `${id}.json`), `${JSON.stringify(live, null, 2)}\n`);
+    writeConfig(root, [{ name: 'crash', argv: nodeArgv('v-slow.js'), timeout_ms: 1200 }]);
+    const { id, laneDir } = reportedDoneTask('P10 崩溃恢复', ['src/p10.ts'], 'probe-m2');
+    const child = spawn(process.execPath, [cli, 'task', 'done', id], { cwd: laneDir, windowsHide: true, stdio: 'ignore' });
+    await sleep(700);
+    child.kill();
+    await sleep(5500);
+    const before = readLive(id);
+    check('P10 崩溃后停在 verifying', before?.status === 'verifying', `实际 ${before?.status}`);
     const r = run(['doctor', '--fix'], root, true);
     const after = readLive(id);
-    check('P10 doctor --fix 恢复为 reported_done', after?.status === 'reported_done', `实际 ${after?.status} ${r.stdout}${r.stderr}`);
-    check('P10 恢复保留 claim', Array.isArray(after?.claims) && after.claims.length > 0, JSON.stringify(after?.claims));
+    check('P10 doctor --fix 恢复为 reported_done', after?.status === 'reported_done', `实际 ${after?.status} ${(r.stdout + r.stderr).trim().slice(0, 160)}`);
+    check('P10 恢复保留 claim', claimsOf(id).length > 0, JSON.stringify(claimsOf(id).map((c) => c.path)));
   }
 
   // P11 只有 reported_done 能 done：claimed 状态必须被拒
@@ -327,7 +363,7 @@ try {
   {
     const { id, laneDir } = reportedDoneTask('P12 未验证合并', ['src/p12.ts'], 'probe-m2');
     const head = git(['rev-parse', 'HEAD'], laneDir);
-    const m = run(['confirm-merge', id, '--commit', head, '--manual', '--reason', 'probe'], root, true);
+    const m = run(['task', 'confirm-merge', id, '--commit', head, '--manual', '--reason', 'probe'], root, true);
     check('P12 reported_done 直接合并退出 1', m.code === 1, `实际 ${m.code} ${(m.stdout + m.stderr).trim().slice(0, 120)}`);
     check('P12 状态仍 reported_done', readLive(id)?.status === 'reported_done', `实际 ${readLive(id)?.status}`);
     check('P12 拒绝文案说明需要先验证', /尚未验证|verify|task done/.test(m.stdout + m.stderr), (m.stdout + m.stderr).trim().slice(0, 160));
@@ -381,7 +417,6 @@ try {
 
   // P17 摘要上限 2 KiB
   {
-    writeFileSync(path.join(root, 'tools', 'v-noisy.js'), "process.stdout.write('x'.repeat(5000)); process.exit(0);\n");
     writeConfig(root, [{ name: 'noisy', argv: nodeArgv('v-noisy.js'), timeout_ms: 60000 }]);
     const { id, laneDir } = reportedDoneTask('P17 摘要截断', ['src/p17.ts'], 'probe-m2');
     const r = run(['task', 'done', id], laneDir, true);

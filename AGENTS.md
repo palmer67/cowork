@@ -77,6 +77,19 @@ DSH 默认装了写保护插件（`dsh-fs-observation-policy`）：**覆盖或�
   `gh workflow run ci.yml`。
 - 推送即触发，所以不要为了"看看 CI"去推半成品到 `main`；在自己的车道分支上推即可。
 
+## 工作副本
+
+- 仓库根（`D:\...\cowork`）只作为**查看与合并的视口**：默认停在 `main`，可能处于 detached HEAD。
+  不要在里面改代码，不要在里面提交。
+- 每个 agent 在自己的车道里干活：
+
+  ```
+  git -C "<仓库绝对路径>" worktree add ".cowork/lanes/<slug>" -b <分支名> origin/main
+  cd "<仓库绝对路径>/.cowork/lanes/<slug>"
+  ```
+
+- 开工前先确认 `pwd` 在车道里、`git log --oneline -1` 是最新的；别人可能刚推了新提交。
+
 ## 分工
 
 - **大量代码实现交给 Codex**：功能开发、重构、批量修复、测试补齐，都在 Codex 自己的车道里写。

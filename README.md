@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
   <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-155%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -93,21 +93,37 @@ cowork task start t-1cb3e3
 cowork task report-done t-1cb3e3
 ```
 
-合并由人确认（M1 没有自动验证）：
+合并前先验证（M2）：
 
 ```bash
+cowork task done t-1cb3e3         # 在 trunk 的验证配置里跑一遍，锁外执行
+# 通过 → awaiting_merge；失败 → verify_failed，lease 和占位都保留，修完再 done
 cowork task confirm-merge t-1cb3e3 --commit 79195ba --manual --reason "人工确认"
 ```
+
+`report-done` 只是「我做完了」的口头声明，直接合并会被拒绝——必须先 `task done` 让验证跑过。
+验证命令来自 trunk 上 `.cowork/config.json` 的 `verification` 段（默认 `npm test`），车道里改这份配置不生效：
+
+```json
+{"schemaVersion":1,"verification":{"name":"test","argv":["npm","test"],"timeout_ms":600000,"enabled":true}}
+```
+
+验证期间 `next` 不会被卡住（锁只短暂持有），所以别人可以继续领别的任务；面板上会显示 `verifying`
+和 `run_id`，CLI 被杀掉后 `cowork doctor --fix` 能把卡住的任务恢复成 `reported_done`。
 
 <details>
 <summary>任务状态机</summary>
 
 ```
 draft ──ready──▶ ready ──next──▶ claimed ──start──▶ in_progress
-      ──report-done──▶ reported_done ──confirm-merge──▶ merged
+      ──report-done──▶ reported_done ──task done──▶ verifying
+      ──通过──▶ awaiting_merge ──confirm-merge──▶ merged
+      ──失败──▶ verify_failed ──task done──▶ verifying
 ```
 
 `block` / `cancel` 由领任务的人调用；`cancel` 会同时放掉 lease 和占位。`next` 本身是一条可恢复的事务：算候选集 → 取锁 → 回滚上次没写完的 → 重新算 → 写 intent → 占 lease → 占文件。要么全成，要么一条不写，强杀也能在下次命令时自动回滚。
+
+验证是「两次只操作 live 的短锁 + 锁外执行」：跑命令期间没有任何锁被占，验证完再取锁、比对 trunk/SHA/脏状态/配置没变才写结果——不满足就 fail closed（判失败，不判通过）。
 </details>
 
 ### 3. 想知道现在谁在动什么
@@ -182,6 +198,8 @@ cowork version
 | `cowork task add / ready / show / ls` | 建 spec、进 ready、查队列 |
 | `cowork next` | 原子领取一个 ready 任务（同时占文件） |
 | `cowork task start / report-done / confirm-merge` | 开工 → 交付 → 合并 |
+| `cowork task report-done <id>` | 「我做完了」，进入待验证 |
+| `cowork task done <id>` | 跑 trunk 配置的验证命令：通过 → 待合并，失败 → 可重试 |
 | `cowork task block / cancel` | 标阻塞 / 取消（取消会释放占位） |
 | `cowork doctor [--fix]` | 体检；`--fix` 清理过期占位、回收 lease、隔离损坏文件 |
 
@@ -239,12 +257,13 @@ cowork version
 ## 参与开发
 
 ```bash
-npm test                              # 133 个测试：node:test + 真实 git worktree
+npm test                              # 155 个测试：node:test + 真实 git worktree
 npx tsc --noEmit                      # 类型检查
 npm run build                         # 编译到 dist/
 node tools/mutex-gate.mjs             # 并发门槛：8 进程 × 1000 次，不许有一次重叠
 node tools/accept-m1.mjs --with-build # M1 验收（10 条）
 node tools/accept-panel.mjs          # M1.5 验收（13 条，含 test / tsc）
+node tools/accept-m2.mjs             # M2 验收（20 条：验证、恢复、契约提醒）
 ```
 
 源码是 TypeScript（ESM，`node:` 前缀），测试用 `node --experimental-strip-types` 直接跑，不经编译。设计文档在 [`docs/`](docs/)，历次交接单在 [`.cowork/notes/`](.cowork/notes/)——cowork 自己也是用它自己管理的。

@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
   <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-155%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -93,21 +93,35 @@ cowork task start t-1cb3e3
 cowork task report-done t-1cb3e3
 ```
 
-A human confirms the merge (M1 has no automatic verification):
+Verify before merging (M2):
 
 ```bash
+cowork task done t-1cb3e3         # runs the trunk verification config outside any lock
+# pass -> awaiting_merge; fail -> verify_failed (lease and claims are kept), fix and re-run
 cowork task confirm-merge t-1cb3e3 --commit 79195ba --manual --reason "reviewed by hand"
 ```
+
+`report-done` is only "I am done"; merging straight from it is refused. The verification command comes from the `verification` block of `.cowork/config.json` **on the trunk commit** (default `npm test`), so editing it inside a lane cannot weaken the exam:
+
+```json
+{"schemaVersion":1,"verification":{"name":"test","argv":["npm","test"],"timeout_ms":600000,"enabled":true}}
+```
+
+`next` is not blocked while a verification runs, the board shows `verifying` plus the `run_id`, and `cowork doctor --fix` recovers a task whose CLI was killed back to `reported_done`.
 
 <details>
 <summary>Task state machine</summary>
 
 ```
 draft --ready--> ready --next--> claimed --start--> in_progress
-      --report-done--> reported_done --confirm-merge--> merged
+      --report-done--> reported_done --task done--> verifying
+      --pass--> awaiting_merge --confirm-merge--> merged
+      --fail--> verify_failed --task done--> verifying
 ```
 
 `block` / `cancel` are called by the lease holder; `cancel` releases both the lease and the claims. `next` itself is a recoverable transaction: compute candidates -> take the lock -> roll back any unfinished transaction -> recompute -> write intent -> take lease -> claim files. All or nothing — even after a hard kill, the next locking command rolls it back.
+
+Verification uses two short locks around the live state plus execution outside all locks: no lock is held while the command runs; afterwards the trunk, HEAD, dirty state and config are compared and the result is written only if nothing moved — otherwise it fails closed.
 </details>
 
 ### 3. See who is touching what
@@ -183,7 +197,9 @@ cowork version
 | `cowork task import <plan.json> [--dry-run] [--ready]` | Validate a plan and create drafts; ready only prints commands |
 | `cowork task add / ready / show / ls` | Create a spec, promote it to ready, inspect the queue |
 | `cowork next` | Atomically claim a ready task (and its files) |
-| `cowork task start / report-done / confirm-merge` | Start -> deliver -> merge |
+| `cowork task start / report-done` | Start -> deliver |
+| `cowork task done <id>` | Run the trunk verification: pass -> awaiting_merge, fail -> retryable |
+| `cowork task confirm-merge` | Merge a verified task |
 | `cowork task block / cancel` | Mark blocked / cancel (cancel releases claims) |
 | `cowork doctor [--fix]` | Health check; `--fix` clears expired claims, reclaims leases, quarantines corrupt files |
 
@@ -241,12 +257,13 @@ The code is plain Node with no native dependencies, but the concurrency primitiv
 ## Contributing
 
 ```bash
-npm test                              # 133 tests: node:test against real git worktrees
+npm test                              # 155 tests: node:test against real git worktrees
 npx tsc --noEmit                      # type check
 npm run build                         # compile to dist/
 node tools/mutex-gate.mjs             # concurrency gate: 8 processes x 1000 runs, zero overlap
 node tools/accept-m1.mjs --with-build # M1 acceptance (10 checks)
 node tools/accept-panel.mjs          # M1.5 acceptance (13 checks, includes test / tsc)
+node tools/accept-m2.mjs             # M2 acceptance (20 checks: verify, recovery, contracts)
 ```
 
 The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight from source via `node --experimental-strip-types`. Design docs live in [`docs/`](docs/); handoff notes in [`.cowork/notes/`](.cowork/notes/) — cowork is managed by cowork itself.

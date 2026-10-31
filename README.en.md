@@ -4,6 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
+  <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
@@ -249,6 +250,8 @@ node tools/accept-panel.mjs          # M1.5 acceptance (13 checks, includes test
 ```
 
 The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight from source via `node --experimental-strip-types`. Design docs live in [`docs/`](docs/); handoff notes in [`.cowork/notes/`](.cowork/notes/) — cowork is managed by cowork itself.
+
+CI runs the same gate on `windows-latest` (`.github/workflows/ci.yml`) and, every Monday, 20 extra rounds of the multi-process stress tests to catch flaky races.
 
 ## Docs
 

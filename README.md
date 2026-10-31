@@ -4,6 +4,7 @@
 
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
+  <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
   <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
@@ -247,6 +248,8 @@ node tools/accept-panel.mjs          # M1.5 验收（13 条，含 test / tsc）
 ```
 
 源码是 TypeScript（ESM，`node:` 前缀），测试用 `node --experimental-strip-types` 直接跑，不经编译。设计文档在 [`docs/`](docs/)，历次交接单在 [`.cowork/notes/`](.cowork/notes/)——cowork 自己也是用它自己管理的。
+
+CI 在 GitHub Actions 的 `windows-latest` 上跑上面这套门禁（`.github/workflows/ci.yml`），每周一额外跑 20 轮多进程压测，抓偶发竞态。
 
 ## 文档
 

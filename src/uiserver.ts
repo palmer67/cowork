@@ -168,11 +168,6 @@ function writeCommand(route: string, body: Record<string, unknown>, root: string
   return command;
 }
 
-function htmlWithToken(html: string, token: string): string {
-  const bootstrap = `<script>window.__COWORK_TOKEN__=${JSON.stringify(token)};history.replaceState(null,'',location.pathname+location.hash);</script>`;
-  return html.replace('</body>', `${bootstrap}</body>`);
-}
-
 function requestToken(req: IncomingMessage, url: URL): string | null {
   if (url.pathname === '/') return url.searchParams.get('t');
   return typeof req.headers['x-cowork-token'] === 'string' ? req.headers['x-cowork-token'] : null;
@@ -217,7 +212,7 @@ export function createPanelServer(info: RepoInfo, options: PanelServerOptions): 
         }
         try {
           const snap = JSON.parse(result.stdout);
-          send(res, 200, htmlWithToken(renderPanel(snap), token), 'text/html; charset=utf-8');
+          send(res, 200, renderPanel(snap, { serve: true }), 'text/html; charset=utf-8');
         } catch (err) {
           send(res, 500, `cowork snapshot --json 返回无效 JSON: ${err instanceof Error ? err.message : String(err)}`, 'text/plain; charset=utf-8');
         }

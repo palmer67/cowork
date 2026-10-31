@@ -183,6 +183,10 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
 响应统一为 `200 {"code":0|1|2|3,"stdout":"…","stderr":"…"}`；参数校验失败返回 `400`，鉴权失败 `401`，
 未知路径 `404`。**面板不翻译 CLI 的错误文本**，原样展示（"谁占着、怎么解决"已经在 CLI 里写好了）。
 
+**身份只用 `cwd` + 环境变量表达**：`/api/lane/<lane>/next` 固定 `cwd=<仓库>/.cowork/lanes/<lane>`、
+`COWORK_AGENT_ID=<lane>`，`--agent` 也由服务端按 lane 填。**写路由不接受客户端传 agent**——面板不能
+代替另一个 agent 行动，快照里的 owner 只是展示信息（见 §11 裁定 R3）。
+
 ### 5.5 安全
 
 1. **只 bind `127.0.0.1`**；`server.listen(port, '127.0.0.1')`。
@@ -235,7 +239,8 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
 
 - 起服务（`--port 0` 时从 stdout 解析真实端口，测试专用）→ `lane new dsh` → `task add` → `ready`
   （需先 commit spec）→ `lane/dsh/next` 拿到 `code 0`，且临时仓库里出现 lease 与 claim；
-- 同一任务再 `next` 一次 → `code 2`，`stdout` 里含占位路径与 `agent=`。
+- 同一任务再 `next` 一次 → `code 1`，`stdout` 里含「没有可领取的任务」与阻塞原因（见 §11 裁定 R1）。
+  `code 2` 只在「锁外候选」与「取锁」之间被别的进程领走时出现；面板不制造这个竞态，只原样透传。
 
 门禁：
 
@@ -252,10 +257,13 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
 5. 带 token `POST /api/lane/new {name:"dsh"}` → `code 0`，仓库里出现 `.cowork/lanes/dsh` 与分支 `cowork/dsh`。
 6. 重复同名 → `code 2`，stdout 含「车道已存在」。
 7. `task add` → `ready` → `POST /api/lane/dsh/next` → `code 0`，任务 live 状态 `claimed`、`lane=dsh`。
-8. 同一任务再派 → `code 2`，输出含「任务已被领取」与赢家车道名。
+8. 同一任务再派（同车道、顺序执行）→ `code 1`，输出含「没有可领取的任务」；任务仍归原车道，
+   live 的 `lane`/`agent` 不变，面板不得因为 `1` 就把卡片标成失败（见 §11 裁定 R1）。
 9. 占位冲突：车道 a 占 `src/auth/login.ts`，车道 b 派工 → `code 2`，输出含路径与 `agent=a`。
 10. `task import plan.json`（3 任务含依赖）→ 3 个 draft、依赖解析正确；把 `depends_on` 改成环 → 退出 1 且目录无新增文件。
-11. 只浏览不点按钮（连刷 5 次 `/api/snapshot`）→ `.git/cowork` 与 `.cowork/tasks` 的 mtime 不变。
+11. 只浏览不点按钮（连刷 5 次 `/api/snapshot`）→ `<git-common-dir>/cowork/{tasks,claims,intents,leases}`
+    与 `.cowork/tasks` 下的**文件集合与 mtime 都不变**；唯一允许变化的是 `<git-common-dir>/cowork/mutex*`
+    锁目录——任何取锁命令都会 touch 它，断言它就等于测错对象（见 §11 裁定 R2）。
 12. `cowork ui --out board.html`（静态模式）仍不监听端口、输出 HTML 且含操作列的「复制命令」。
 13. `npm test` 退出 0、`npx tsc --noEmit` 静默、`package.json` 的 `dependencies` 仍为空。
 
@@ -280,3 +288,20 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
 1. 面板是否真的没有直接写任何状态文件（`grep -rn "writeFileSync\|renameSync" src/uiserver.ts` 必须为空）。
 2. 有没有引入依赖、有没有监听 `0.0.0.0`（`grep -n "0.0.0.0" src/*.ts` 必须为空）。
 3. 静态 `ui` 的行为是否还和 M1 一致（`npm test` 里 `test/ui.test.ts` 不改断言直接过）。
+
+## 12. 判官裁定（2026-10-31，对 Codex 的三点提问）
+
+- **R1 顺序重复 `next` 的返回码：保留 M1 的 `1`，不改 CLI。** 依据 `src/tasknext.ts:369-378`
+  `pickWinner()` 只从**锁外候选集**（只含 ready 任务）里找已持有的任务；同一个车道第二次 `next` 时
+  该任务已不是 ready，`before` 与 `after` 都空 → 走 `:414-419` 的 `general()`（`exit 1`「没有可领取的任务」）。
+  `kind: 'busy'`（`exit 2`）只在锁外候选非空、取锁后候选变空、且候选里能挑出持有者时抛出（`:404-412`）。
+  历史背景：M1 设计评审 P3 已经定过同一条规则——「只有占位被别人拿走」才是 `2`，其余一律 `1`。
+  因此 §7 集成测试与 §8 第 8 条按上面的 `1` 修正；面板对 `1`/`2` 一视同仁地原样展示，不做语义猜测。
+- **R2 只读验收排除 mutex 父目录：允许。** 任何取锁命令（包括读路径上 `ensureState` 之后的 mutex
+  创建/删除）都会改动 `<git-common-dir>/cowork/` 这一层的 mtime，断言它等于断言「锁没被用过」，
+  是测错对象。验收改为查 `tasks|claims|intents|leases` 四个子目录与 `.cowork/tasks` 的**文件集合 +
+  mtime**，mutex 目录显式豁免。豁免范围只到 mutex，不放宽到整个 `.git/cowork`。
+- **R3 不新增 `agent` 字段。** 身份由 `cwd`（车道 worktree）+ `COWORK_AGENT_ID=<lane>` 决定，`next`
+  的 `--agent` 由服务端按 lane 名填；写路由一律拒绝客户端传入的 `agent`（`400`）。理由：D11 的整个
+  前提是「面板只是 CLI 的遥控器」，允许面板代为指定 agent 就等于绕过「谁占着」的身份语义，而 M1 的
+  占位与租约都建立在 agent 身份上。快照里的 owner 仅供展示。

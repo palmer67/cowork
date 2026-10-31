@@ -311,6 +311,7 @@ export interface TransitionOptions {
 export interface M2TransitionOptions extends TransitionOptions {
   verification?: VerificationLive | null;
   recovery?: TaskRecovery | null;
+  historyAgent?: string | null;
 }
 
 const M2_TRANSITIONS: Partial<Record<TaskStatus, readonly TaskStatus[]>> = {
@@ -352,7 +353,7 @@ export function transitionM2Task(
     recovery: options.recovery !== undefined ? options.recovery : current.recovery,
     history: [
       ...current.history,
-      { at: now, from: current.status, to, agent: options.agent ?? current.agent, note: options.note ?? null },
+      { at: now, from: current.status, to, agent: options.historyAgent ?? options.agent ?? current.agent, note: options.note ?? null },
     ],
   };
   writeTaskLive(state, next);

@@ -184,7 +184,7 @@ function requireRun(state: string, id: string, runId: string): TaskLive {
   return live;
 }
 
-function pidStartTime(pid: number): Promise<{ at: string | null; error: string | null }> {
+export function readPidStartedAt(pid: number): Promise<{ at: string | null; error: string | null }> {
   if (process.platform !== 'win32') return Promise.resolve({ at: null, error: 'PowerShell PID 启动时间查询仅在 Windows 提供' });
   const script = "$p=Get-Process -Id ([int]$env:COWORK_PID) -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')";
   const env = {

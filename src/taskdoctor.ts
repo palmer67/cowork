@@ -1,4 +1,5 @@
 import { lstatSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { hostname } from 'node:os';
 import path from 'node:path';
 import { isExpired } from './claims.ts';
 import { gitTry, type RepoInfo } from './git.ts';
@@ -7,11 +8,14 @@ import { listClaims, stateRoot } from './store.ts';
 import {
   listTaskLiveStates,
   taskLiveFile,
+  transitionM2Task,
   writeTaskLive,
   type TaskLive,
+  type VerificationLive,
 } from './taskstore.ts';
 import { findDependencyCycle, readTrunkCatalog, type TaskCatalog } from './tasks.ts';
 import { listIntents, recoverIntents } from './tasknext.ts';
+import { readPidStartedAt } from './taskverify.ts';
 
 export interface TaskDoctorReport {
   /** 仍未解决/需要人看的问题，每条都带文件与怎么修。 */
@@ -25,9 +29,114 @@ export interface TaskDoctorReport {
 const LEASE_STATUSES = new Set(['claimed', 'in_progress']);
 const LOCK_TMP_MAX_AGE_MS = 60_000;
 const TRASH_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const UNVERIFIED_NOTICE_MS = 24 * 60 * 60 * 1000;
+
+interface VerificationCandidate {
+  id: string;
+  task_status: 'verifying' | 'blocked';
+  run_id: string;
+  pid: number | null;
+  host: string | null;
+  pid_started_at: string | null;
+}
+
+interface RecoveryDecision {
+  candidate: VerificationCandidate;
+  recover: boolean;
+  reason: string;
+}
 
 function describeProblem(file: string, issue: string, fix: string): string {
   return `${file}: ${issue}；${fix}`;
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+function verificationCandidate(live: TaskLive): VerificationCandidate | null {
+  const verification = live.verification;
+  if (
+    verification === null ||
+    (live.status !== 'verifying' && !(live.status === 'blocked' && verification.status === 'running'))
+  ) return null;
+  return {
+    id: live.id,
+    task_status: live.status,
+    run_id: verification.run_id,
+    pid: verification.pid,
+    host: verification.host,
+    pid_started_at: verification.pid_started_at,
+  };
+}
+
+async function inspectVerification(candidate: VerificationCandidate): Promise<RecoveryDecision> {
+  if (candidate.pid === null) return { candidate, recover: true, reason: '验证进程未启动（pid=null）' };
+  if (candidate.host !== hostname()) {
+    return { candidate, recover: false, reason: `验证进程 host=${candidate.host ?? '(未知)'}，当前 host=${hostname()}，无法检查` };
+  }
+  if (candidate.pid === process.pid) {
+    return { candidate, recover: true, reason: 'pid 等于 doctor CLI 自身，验证子进程未启动' };
+  }
+  if (!pidAlive(candidate.pid)) return { candidate, recover: true, reason: `原验证 PID ${candidate.pid} 已不存在` };
+  if (candidate.pid_started_at === null) {
+    return { candidate, recover: false, reason: `PID ${candidate.pid} 仍存在但 pid_started_at 不可得，拒绝恢复` };
+  }
+  const current = await readPidStartedAt(candidate.pid);
+  if (current.at === null) {
+    if (!pidAlive(candidate.pid)) return { candidate, recover: true, reason: `原验证 PID ${candidate.pid} 已不存在` };
+    return { candidate, recover: false, reason: `PID ${candidate.pid} 启动时间读取失败（${current.error ?? '未知原因'}），拒绝恢复` };
+  }
+  if (current.at !== candidate.pid_started_at) {
+    return { candidate, recover: true, reason: `PID ${candidate.pid} 已复用（启动时间 ${candidate.pid_started_at} → ${current.at}）` };
+  }
+  return { candidate, recover: false, reason: `原验证进程仍在运行（pid=${candidate.pid}）` };
+}
+
+function recoverVerification(state: string, decision: RecoveryDecision, fixed: string[]): void {
+  const { candidate } = decision;
+  const live = listTaskLiveStates(state).lives.find((item) => item.id === candidate.id);
+  if (
+    !decision.recover || live === undefined || live.status !== candidate.task_status ||
+    live.verification?.run_id !== candidate.run_id || live.verification.pid !== candidate.pid ||
+    live.verification.host !== candidate.host || live.verification.pid_started_at !== candidate.pid_started_at
+  ) return;
+  const now = new Date().toISOString();
+  const verification: VerificationLive = {
+    ...live.verification,
+    status: 'stale',
+    finished_at: now,
+    summary: decision.reason,
+  };
+  const recovery = { at: now, run_id: candidate.run_id, reason: decision.reason };
+  if (candidate.task_status === 'blocked') {
+    writeTaskLive(state, { ...live, updated_at: now, verification, recovery });
+    fixed.push(`已收尾阻塞任务 ${live.id} 的残留验证（${decision.reason}；保留状态与占位）`);
+    return;
+  }
+  transitionM2Task(state, live.id, 'reported_done', {
+    agent: live.agent,
+    historyAgent: 'doctor',
+    note: `doctor --fix recovery: ${decision.reason}`,
+    verification,
+    recovery,
+  });
+  fixed.push(`已恢复验证 ${live.id} → reported_done（${decision.reason}；保留 lease/claims）`);
+}
+
+function unverifiedNotices(lives: readonly TaskLive[], now = Date.now()): string[] {
+  return lives.flatMap((live) => {
+    if (live.status !== 'reported_done') return [];
+    const report = [...live.history].reverse().find((entry) => entry.to === 'reported_done');
+    const at = Date.parse(report?.at ?? live.updated_at);
+    if (!Number.isFinite(at) || now - at <= UNVERIFIED_NOTICE_MS) return [];
+    return [`${live.id}: reported_done 超过 24 小时，尚未验证；运行 cowork task done ${live.id}`];
+  });
 }
 
 function leaseProblems(info: RepoInfo, catalog: TaskCatalog, lives: readonly TaskLive[]): string[] {
@@ -199,9 +308,21 @@ export async function doctorTasks(info: RepoInfo, fix: boolean): Promise<TaskDoc
   const catalog = readTrunkCatalog(info);
   const state = stateRoot(info);
   const fixed: string[] = [];
+  const recoveryDecisions: RecoveryDecision[] = [];
   if (fix) {
     // 回滚 intent、隔离坏 live、回收过期 lease 都是写 live，必须独占全局锁。
-    await withLock(state, () => fixPass(info, state, catalog, fixed), { createStateDir: false });
+    const candidates = await withLock(state, () => {
+      fixPass(info, state, catalog, fixed);
+      return listTaskLiveStates(state).lives
+        .map(verificationCandidate)
+        .filter((item): item is VerificationCandidate => item !== null);
+    }, { createStateDir: false });
+    for (const candidate of candidates) recoveryDecisions.push(await inspectVerification(candidate));
+    if (recoveryDecisions.some((decision) => decision.recover)) {
+      await withLock(state, () => {
+        for (const decision of recoveryDecisions) recoverVerification(state, decision, fixed);
+      }, { createStateDir: false });
+    }
   }
 
   const states = listTaskLiveStates(state);
@@ -215,8 +336,14 @@ export async function doctorTasks(info: RepoInfo, fix: boolean): Promise<TaskDoc
       describeProblem(item.file, `残留未完成 next 事务（${item.intent.task_id}）`, 'cowork doctor --fix 回滚，或重新运行 cowork next'),
     );
   }
-  const notices = staleArtifacts(state).map((artifact) =>
+  const notices = [
+    ...staleArtifacts(state).map((artifact) =>
     `${artifact.path}: ${artifact.kind === 'lock.tmp' ? '超过 60 秒的锁临时目录' : '超过 24 小时的 trash 条目'}；运行 cowork doctor --fix 清理`,
-  );
+    ),
+    ...unverifiedNotices(states.lives),
+    ...recoveryDecisions.filter((decision) => !decision.recover).map((decision) =>
+      `${decision.candidate.id}: ${decision.reason}；仅在确认原验证进程退出或 PID 已复用后恢复`,
+    ),
+  ];
   return { problems, fixed, notices };
 }

@@ -1,13 +1,15 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { expiresAt, isExpired } from './claims.ts';
 import { git, headCommit, type RepoInfo } from './git.ts';
+import { buildContractAlerts, type ContractAlert } from './contracts.ts';
+import { readHandoffs, type HandoffMeta } from './handoffs.ts';
 import { withLock } from './mutex.ts';
-import { conflicts, parseClaim, type ClaimPath } from './paths.ts';
 import { listClaims, stateRoot, type ClaimRecord } from './store.ts';
 import { collectTaskViews, type TaskView } from './taskops.ts';
-import { listTaskLiveStates, type TaskLiveStates } from './taskstore.ts';
+import { listTaskLiveStates, type TaskLiveStates, type VerificationLive } from './taskstore.ts';
 import { readTrunkCatalog } from './tasks.ts';
+import { listWorktrees, type Worktree } from './worktrees.ts';
 
 /**
  * 最近一次交接单。契约字段是 id 与 created_at；title/path 是给面板的附加信息，
@@ -68,14 +70,7 @@ export interface SnapshotTask {
   spec_commit: string | null;
   updated_at: string | null;
   blocked_reason: string | null;
-}
-
-/** reads ↔ 其他活跃任务 touches 的重叠提醒（M1 只报这一种契约冲突）。 */
-export interface ContractAlert {
-  kind: 'reads_touches';
-  task: string;
-  path: string;
-  peer_task: string;
+  verification: VerificationLive | null;
 }
 
 export interface Snapshot {
@@ -89,50 +84,6 @@ export interface Snapshot {
   claims: SnapshotClaim[];
   contract_alerts: ContractAlert[];
   lanes: SnapshotLane[];
-}
-
-interface Worktree {
-  path: string;
-  head: string | null;
-  branch: string | null;
-}
-
-interface HandoffMeta {
-  id: string;
-  created_at: string | null;
-  title: string | null;
-  path: string;
-  lane: string;
-}
-
-/** `git worktree list --porcelain -z`：记录之间用空 token 分隔。 */
-function listWorktrees(mainRoot: string): Worktree[] {
-  const raw = git(['worktree', 'list', '--porcelain', '-z'], mainRoot);
-  const out: Worktree[] = [];
-  let current: Worktree | null = null;
-  for (const token of raw.split('\0')) {
-    if (token === '') {
-      if (current !== null) out.push(current);
-      current = null;
-      continue;
-    }
-    const space = token.indexOf(' ');
-    const key = space < 0 ? token : token.slice(0, space);
-    const value = space < 0 ? '' : token.slice(space + 1);
-    if (key === 'worktree') {
-      if (current !== null) out.push(current);
-      current = { path: value, head: null, branch: null };
-      continue;
-    }
-    if (current === null) continue;
-    if (key === 'HEAD') {
-      current.head = value;
-    } else if (key === 'branch') {
-      current.branch = value.startsWith('refs/heads/') ? value.slice('refs/heads/'.length) : value;
-    }
-  }
-  if (current !== null) out.push(current);
-  return out;
 }
 
 /**
@@ -152,108 +103,6 @@ export function parseStatusCount(raw: string): number {
     if (x === 'R' || x === 'C' || y === 'R' || y === 'C') i += 1;
   }
   return paths.size;
-}
-
-const FRONT_MATTER = /^\uFEFF?---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
-
-function frontMatter(text: string): string | null {
-  const match = FRONT_MATTER.exec(text);
-  return match?.[1] ?? null;
-}
-
-function asRecord(value: unknown): Record<string, unknown> | null {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
-  return value as Record<string, unknown>;
-}
-
-function normalizeTime(raw: string | null): string | null {
-  if (raw === null) return null;
-  const ms = Date.parse(raw);
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : raw;
-}
-
-interface HandoffsRead {
-  metas: HandoffMeta[];
-  diagnostics: string[];
-  /** notes 目录存在但读不了（权限、被占用、同名文件）。 */
-  unreadable: boolean;
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * 读该车道工作树里可见（含未提交）的交接单。
- * 坏文件不让整份快照挂掉，但也不能静默：每一项都带上"哪份文件、什么原因"。
- */
-function readHandoffs(notesDir: string): HandoffsRead {
-  let names: string[];
-  try {
-    names = readdirSync(notesDir);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // 没有 .cowork/notes 是正常情况（还没写过交接单）。
-    if (code === 'ENOENT') return { metas: [], diagnostics: [], unreadable: false };
-    return {
-      metas: [],
-      diagnostics: [`无法读取交接目录 ${notesDir}: ${errorText(err)}`],
-      unreadable: true,
-    };
-  }
-  const metas: HandoffMeta[] = [];
-  const diagnostics: string[] = [];
-  for (const name of names) {
-    if (!name.endsWith('.md')) continue;
-    const file = path.join(notesDir, name);
-    let text: string;
-    try {
-      text = readFileSync(file, 'utf8');
-    } catch (err) {
-      diagnostics.push(`${name}: 无法读取（${errorText(err)}）`);
-      continue;
-    }
-    const body = frontMatter(text);
-    if (body === null) {
-      diagnostics.push(`${name}: 缺少 --- 包裹的 JSON front matter`);
-      continue;
-    }
-    let raw: unknown;
-    try {
-      raw = JSON.parse(body);
-    } catch (err) {
-      diagnostics.push(`${name}: front matter 不是合法 JSON（${errorText(err)}）`);
-      continue;
-    }
-    const meta = asRecord(raw);
-    if (meta === null) {
-      diagnostics.push(`${name}: front matter 不是 JSON 对象`);
-      continue;
-    }
-    const lane = typeof meta['lane'] === 'string' ? meta['lane'].trim() : '';
-    if (lane === '') {
-      diagnostics.push(`${name}: 缺少 lane 字段`);
-      continue;
-    }
-    const rawTime =
-      typeof meta['createdAt'] === 'string'
-        ? meta['createdAt']
-        : typeof meta['at'] === 'string'
-          ? meta['at']
-          : null;
-    const id =
-      typeof meta['id'] === 'string' && meta['id'] !== ''
-        ? meta['id']
-        : path.basename(name, '.md');
-    const title =
-      typeof meta['task'] === 'string'
-        ? meta['task']
-        : typeof meta['title'] === 'string'
-          ? meta['title']
-          : null;
-    metas.push({ id, created_at: normalizeTime(rawTime), title, path: file, lane });
-  }
-  return { metas, diagnostics, unreadable: false };
 }
 
 function timeValue(iso: string | null): number {
@@ -299,7 +148,7 @@ function attempt(args: string[], cwd: string): GitAttempt {
   }
 }
 
-function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
+function observeLane(worktree: Worktree, lane: string | null, info: RepoInfo): { entry: SnapshotLane; handoffs: HandoffMeta[] } {
   const lanePath = path.resolve(worktree.path);
   const entry: SnapshotLane = {
     lane,
@@ -313,7 +162,7 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
   if (!existsSync(lanePath)) {
     entry.observed_at = new Date().toISOString();
     entry.error = `工作树目录不存在（worktree 登记仍在）: ${lanePath}`;
-    return entry;
+    return { entry, handoffs: [] };
   }
 
   const head = attempt(['rev-parse', '--short', 'HEAD'], lanePath);
@@ -333,14 +182,14 @@ function observeLane(worktree: Worktree, lane: string | null): SnapshotLane {
     entry.error = `git status 读取失败: ${status.error}`;
   }
 
-  const handoffs = readHandoffs(path.join(lanePath, '.cowork', 'notes'));
+  const handoffs = readHandoffs(path.join(lanePath, '.cowork', 'notes'), info);
   if (handoffs.diagnostics.length > 0) {
     entry.handoff_diagnostics = handoffs.diagnostics;
     // notes 目录本身读不了时，这条车道的交接信息不可信，按错误暴露出来。
     if (handoffs.unreadable && entry.error === undefined) entry.error = handoffs.diagnostics[0];
   }
   entry.last_handoff = latestHandoff(handoffs.metas, lane, worktree.branch);
-  return entry;
+  return { entry, handoffs: handoffs.metas };
 }
 
 /** live 记录在 mutex 内一次读齐，映射/派生都在锁外做。 */
@@ -382,37 +231,8 @@ function toSnapshotTask(view: TaskView): SnapshotTask {
     spec_commit: view.spec_commit,
     updated_at: view.updated_at,
     blocked_reason: view.blocked_reason,
+    verification: view.verification,
   };
-}
-
-const ACTIVE_STATUSES = new Set(['ready', 'claimed', 'in_progress', 'reported_done', 'blocked']);
-
-/** 只提示"我在读、别人在写"的重叠；spec 路径已经过 paths.ts 规范化，这里再包一层容错。 */
-function contractAlerts(info: RepoInfo, views: readonly TaskView[]): ContractAlert[] {
-  const alerts: ContractAlert[] = [];
-  const active = views.filter((view) => ACTIVE_STATUSES.has(view.status));
-  const claimOf = (raw: string): ClaimPath | null => {
-    try {
-      return parseClaim(raw, info);
-    } catch {
-      return null;
-    }
-  };
-  for (const reader of active) {
-    const reads = reader.reads.map(claimOf).filter((item): item is ClaimPath => item !== null);
-    if (reads.length === 0) continue;
-    for (const writer of active) {
-      if (writer.id === reader.id) continue;
-      const touches = writer.touches.map(claimOf).filter((item): item is ClaimPath => item !== null);
-      for (const read of reads) {
-        const hit = touches.find((touch) => conflicts(read, touch));
-        if (hit !== undefined) {
-          alerts.push({ kind: 'reads_touches', task: reader.id, path: read.display, peer_task: writer.id });
-        }
-      }
-    }
-  }
-  return alerts;
 }
 
 /** 面板唯一数据源；只读，不写 claims，也不创建状态目录。 */
@@ -435,16 +255,21 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
 
   const lanesRoot = path.join(info.mainRoot, '.cowork', 'lanes');
   const lanes: SnapshotLane[] = [];
+  const handoffs: HandoffMeta[] = [];
   for (const worktree of listWorktrees(info.mainRoot)) {
     // 主工作树也是一条工作树：Codex 之类在主工作树干活时，未提交改动同样要看得见。
     if (samePath(worktree.path, info.mainRoot)) {
-      lanes.push(observeLane(worktree, null));
+      const observed = observeLane(worktree, null, info);
+      lanes.push(observed.entry);
+      handoffs.push(...observed.handoffs);
       continue;
     }
     const rel = path.relative(lanesRoot, path.resolve(worktree.path));
     // 按路径段判断，不能 startsWith('..')：合法车道名可以就叫 ..hidden。
     if (rel === '' || path.isAbsolute(rel) || rel.split(path.sep).includes('..')) continue;
-    lanes.push(observeLane(worktree, rel.split(path.sep).join('/')));
+    const observed = observeLane(worktree, rel.split(path.sep).join('/'), info);
+    lanes.push(observed.entry);
+    handoffs.push(...observed.handoffs);
   }
   lanes.sort((a, b) => {
     if (a.lane === null) return b.lane === null ? 0 : -1;
@@ -459,7 +284,7 @@ export async function snapshot(info: RepoInfo): Promise<Snapshot> {
     tasks,
     task_diagnostics: taskDiagnostics,
     claims,
-    contract_alerts: contractAlerts(info, view.views),
+    contract_alerts: buildContractAlerts(info, view.views, handoffs),
     lanes,
   };
 }

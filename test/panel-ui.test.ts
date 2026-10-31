@@ -54,7 +54,7 @@ test('按状态与 owner 禁用动作；ready/confirm-merge 不受 owner 限制'
   const tasks = [
     ownedTask('t-start01', 'claimed'), ownedTask('t-report1', 'in_progress'),
     ownedTask('t-block01', 'in_progress'), ownedTask('t-cancel1', 'claimed'),
-    ownedTask('t-ready01', 'draft'), ownedTask('t-merge01', 'reported_done'),
+    ownedTask('t-ready01', 'draft'), ownedTask('t-merge01', 'awaiting_merge'),
   ];
   const board = renderBoard({ ...snap, panel_agent: 'panel-operator', tasks }, { serve: true });
   for (const [id, action] of [['t-start01', 'start'], ['t-report1', 'report-done'], ['t-block01', 'block'], ['t-cancel1', 'cancel']]) {

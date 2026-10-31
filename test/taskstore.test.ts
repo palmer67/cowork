@@ -10,6 +10,7 @@ import {
   markCorrupt,
   readTaskLive,
   taskLiveFile,
+  transitionM2Task,
   transitionTask,
   writeTaskLive,
 } from '../src/taskstore.ts';
@@ -50,6 +51,40 @@ test('transitionTask 从缺失状态按 draft 起算并追加 history', () => {
     assert.equal(claimed.history.length, 2);
     const reread = readTaskLive(fixture.state, ID);
     assert.deepEqual(reread, claimed);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('M2 状态与 verification live 记录可读写，普通 M1 转移入口仍隔离', () => {
+  const fixture = makeState();
+  try {
+    transitionTask(fixture.state, ID, 'ready');
+    transitionTask(fixture.state, ID, 'claimed', { lane: 'dsh-m2', lanePath: 'D:/repo/.cowork/lanes/dsh-m2', agent: 'dsh' });
+    transitionTask(fixture.state, ID, 'in_progress');
+    transitionTask(fixture.state, ID, 'reported_done');
+    const started = transitionM2Task(fixture.state, ID, 'verifying', {
+      verification: {
+        run_id: 'verify-1', status: 'running', pid: null, host: null,
+        pid_started_at: null, pid_start_error: null, started_at: '2026-11-01T00:00:00.000Z',
+        finished_at: null, head_before: 'a'.repeat(40), head_after: null,
+        config_commit: 'b'.repeat(40), summary: '', records: [],
+      },
+    });
+    assert.equal(started.status, 'verifying');
+    assert.equal(readTaskLive(fixture.state, ID)?.verification?.config_commit, 'b'.repeat(40));
+    assert.throws(() => transitionM2Task(fixture.state, ID, 'merged'), /非法 M2 状态转换/);
+    const failed = transitionM2Task(fixture.state, ID, 'verify_failed', {
+      verification: { ...started.verification!, status: 'failed', finished_at: '2026-11-01T00:00:01.000Z' },
+    });
+    assert.equal(failed.status, 'verify_failed');
+    assert.deepEqual(readTaskLive(fixture.state, ID), failed);
+    const blocked = transitionM2Task(fixture.state, ID, 'blocked', { agent: 'dsh', reason: '等待外部确认' });
+    assert.equal(blocked.status, 'blocked');
+    assert.equal(blocked.blocked_reason, '等待外部确认');
+    const ready = transitionTask(fixture.state, ID, 'ready', { agent: null, lane: null, lanePath: null });
+    assert.equal(ready.status, 'ready');
+    assert.equal(ready.lane, null);
   } finally {
     fixture.cleanup();
   }

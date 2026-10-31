@@ -13,11 +13,12 @@ import {
   ensureState,
   listClaims,
   readClaim,
+  removeClaim,
   stateRoot,
   writeClaim,
   type ClaimRecord,
 } from '../src/store.ts';
-import { readTaskLive, transitionTask } from '../src/taskstore.ts';
+import { readTaskLive, transitionM2Task, transitionTask } from '../src/taskstore.ts';
 import { readTrunkCatalog } from '../src/tasks.ts';
 import { intentFile, listIntents, next, recoverIntents, writeIntent, type NextIntent } from '../src/tasknext.ts';
 import { removeTree } from './helpers.ts';
@@ -207,6 +208,31 @@ test('touches 与另一任务的 held lease 重叠时退出 1', async () => {
     assert.match(err.message, /重叠/);
   } finally {
     fixture.cleanup();
+  }
+});
+
+test('verifying、verify_failed、awaiting_merge 的 held lease 仍阻止同路径领取', async () => {
+  for (const status of ['verifying', 'verify_failed', 'awaiting_merge'] as const) {
+    const fixture = makeRepo([ALPHA, GAMMA]);
+    try {
+      markReady(fixture, ['t-00a1b2', 't-00c5d6']);
+      const acquired = await next(fixture.info, { agent: 'codex' });
+      assert.equal(acquired.task.id, 't-00a1b2');
+      removeClaim(fixture.state, claimId(parseClaim('src/alpha/**', fixture.info)));
+      transitionTask(fixture.state, 't-00a1b2', 'in_progress', { agent: 'codex' });
+      transitionTask(fixture.state, 't-00a1b2', 'reported_done', { agent: 'codex' });
+      if (status === 'verifying') {
+        transitionM2Task(fixture.state, 't-00a1b2', 'verifying', { agent: 'codex' });
+      } else {
+        transitionM2Task(fixture.state, 't-00a1b2', 'verifying', { agent: 'codex' });
+        transitionM2Task(fixture.state, 't-00a1b2', status, { agent: 'codex' });
+      }
+      const err = await expectCode(() => next(fixture.info, { agent: 'dsh' }), EXIT.GENERAL);
+      assert.match(err.message, /t-00a1b2/);
+      assert.match(err.message, /重叠/);
+    } finally {
+      fixture.cleanup();
+    }
   }
 });
 

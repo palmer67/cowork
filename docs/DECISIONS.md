@@ -209,6 +209,23 @@ trunk 正常前进后再改写同一份 spec，旧提交仍是祖先，检查会
 
 若要更强约束，需要的是仓库外的身份/审批系统，而不是在这个 CLI 里加一层可伪造的参数。
 
+## D13 — M2 验证结果先于人工合并
+
+状态：已定（2026-11-01，PERMIT-m2）
+
+| 当前状态 | 操作 / 结果 | 下一状态 | 退出码 |
+|---|---|---|---:|
+| `reported_done` / `verify_failed` | `task done` 全部检查通过 | `awaiting_merge` | 0 |
+| `reported_done` / `verify_failed` | 检查失败、超时、dirty 或快照漂移 | `verify_failed` | 1 |
+| `reported_done` / `verify_failed` | 验证程序无法启动 | `reported_done`，记录 spawn 错误 | 1 |
+| `verifying` | `doctor --fix` 确认进程已退出、PID 已复用或验证未启动 | `reported_done`，记录 recovery | 0 |
+| `awaiting_merge` | `confirm-merge --commit` 人工确认目标 | `merged` | 0 |
+| `reported_done` | `confirm-merge` | 拒绝；提示先运行 `task done` | 1 |
+
+验证配置只从 trunk 固定提交的 `.cowork/config.json` 读取，SHA 写入 `verification.config_commit`。
+Git 读取与验证子进程均在 mutex 外；锁内只更新 live。两次 Git 快照不一致或第二次发现 dirty
+时失败关闭。恢复只由 `doctor --fix` 执行；PID 启动时间不可得时只提示，不恢复。
+
 ## D11 — 面板默认只读；`--serve` 是本机前台的可写例外（补充 D8）
 
 状态：已定（2026-10-31，WORKORDER-PANEL §3、§12）

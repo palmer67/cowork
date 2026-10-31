@@ -69,14 +69,14 @@ process.on('exit', () => {
   }
 });
 
-function run(cmd, args, cwd, env = {}, shell = false) {
+function run(cmd, args, cwd, env = {}, shell = false, timeoutMs = 120_000) {
   const r = spawnSync(cmd, args, {
     cwd,
     encoding: 'utf8',
     env: { ...process.env, ...env },
     windowsHide: true,
     shell,
-    timeout: 120_000,
+    timeout: timeoutMs,
   });
   return { code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
@@ -332,6 +332,15 @@ def(6, 'snapshot 显示 ready 与 spec_commit', () => {
 // 7. 依赖只认 merged
 def(7, '依赖只认 merged（reported_done 不解锁）', () => {
   const root = newRepo();
+  const configPath = path.join(root, '.cowork', 'config.json');
+  const config = JSON.parse(readFileSync(configPath, 'utf8'));
+  config.verification = {
+    allow_disabled: false,
+    commands: [{ name: 'accept', argv: [process.execPath, '-e', 'process.exit(0)'], timeout_ms: 5000, enabled: true }],
+    env_allowlist: ['PATH', 'SystemRoot', 'ComSpec', 'TEMP', 'TMP', 'COWORK_AGENT_ID'],
+  };
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+  commitAll(root, 'configure verification');
   const a = lane(root, 'a');
   const b = lane(root, 'b');
   const { check, done } = makeChecker();
@@ -347,6 +356,8 @@ def(7, '依赖只认 merged（reported_done 不解锁）', () => {
   check(gotA.code === 0 && gotA.out.includes(A.id), `车道 a 应领到 A：${gotA.out.trim().slice(0, 200)}`);
   check(cw(a, ['task', 'start', A.id], 'a').code === 0, 'A start 失败');
   check(cw(a, ['task', 'report-done', A.id], 'a').code === 0, 'A report-done 失败');
+  const verified = cw(a, ['task', 'done', A.id], 'a');
+  check(verified.code === 0, `A task done 验证失败：${verified.out.trim().slice(0, 200)}`);
 
   const blocked = cw(b, ['next'], 'b');
   check(blocked.code === 1, `A 只到 reported_done 时 B 应不可领（exit 1），实际 ${blocked.code}`);
@@ -455,7 +466,7 @@ def(9, '损坏 live 不伪装成空；半成品 intent 可回滚后再领取', (
 // 10. 构建与测试门槛
 def(10, 'npm test ≥60 且 tsc 干净（默认执行）', () => {
   // Windows 上 npm 是 npm.cmd，直接 spawn 会 ENOENT；只有这条命令需要 shell。
-  const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32');
+  const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32', 600_000);
   if (test.code !== 0) return [`npm test 退出 ${test.code}\n${test.out.trim().slice(-600)}`];
   const m = test.out.match(/#\s*tests\s+(\d+)/);
   const count = m ? Number(m[1]) : 0;

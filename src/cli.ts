@@ -27,6 +27,7 @@ import { readTrunkCatalog } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 import { importPlan } from './planimport.ts';
 import { createPanelServer, parsePort } from './uiserver.ts';
+import { taskDone } from './taskverify.ts';
 
 /** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
 const KNOWN_COMMANDS = new Set([
@@ -60,7 +61,8 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork next [--agent <名>] [--json]
                                   领取一个 ready 任务（FIFO；崩溃事务可恢复）
   cowork task start|report-done <id>
-  cowork task confirm-merge <id> --commit <sha> --manual --reason <文本>
+  cowork task done <id>           执行 trunk 配置的自动验证
+  cowork task confirm-merge <id> --commit <sha> [--manual --reason <文本>]
   cowork task block <id> --reason <文本>
   cowork task cancel <id> [--reason <文本>]
   cowork task import <plan.json> [--dry-run] [--ready]
@@ -586,8 +588,19 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
     case 'report-done': {
       const live = await reportDone(info, needId(), agent);
       console.log(`${live.id} → reported_done（agent=${agent}）`);
-      console.log(`合并后运行 cowork task confirm-merge ${live.id} --commit <sha> --manual --reason "..."。`);
+      console.log(`尚未验证；运行 cowork task done ${live.id}。`);
       return EXIT.OK;
+    }
+    case 'done': {
+      const result = await taskDone(info, needId(), agent);
+      console.log(`${result.live.id} → ${result.live.status}`);
+      console.log(result.message);
+      if (result.output !== '') {
+        console.log('验证输出:');
+        process.stdout.write(result.output);
+        if (!result.output.endsWith('\n')) process.stdout.write('\n');
+      }
+      return result.passed ? EXIT.OK : EXIT.GENERAL;
     }
     case 'confirm-merge': {
       const commit = value(args, 'commit') ?? '';
@@ -634,7 +647,7 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
     default:
       throw general(
         `未知 task 子命令: ${sub === '' ? '(空)' : sub}`,
-        '可用: add / ls / show / ready / start / report-done / confirm-merge / block / cancel。',
+        '可用: add / ls / show / ready / start / report-done / done / confirm-merge / block / cancel。',
       );
   }
 }
@@ -655,6 +668,13 @@ async function runNext(info: RepoInfo, args: Args): Promise<number> {
   console.log(`  done_when: ${result.task.done_when.join('; ') || '(空)'}`);
   console.log(`  lane: ${result.live.lane ?? '(main)'}  agent: ${agent}`);
   console.log(`  spec_commit: ${result.specCommit}`);
+  if (result.contract_alerts.length > 0) {
+    console.log('契约提醒:');
+    for (const alert of result.contract_alerts) {
+      const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
+      console.log(`  ${alert.kind}: ${alert.path} ← ${source || alert.summary}${source ? `（${alert.summary}）` : ''}`);
+    }
+  }
   console.log('下一步: cowork task start ' + result.task.id);
   return EXIT.OK;
 }

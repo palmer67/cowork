@@ -4,6 +4,8 @@ import path from 'node:path';
 import { busy, general } from './errors.ts';
 import { currentBranch, type RepoInfo } from './git.ts';
 import { withLock } from './mutex.ts';
+import { buildContractAlerts, type ContractAlert, type ContractTask } from './contracts.ts';
+import { readRepositoryHandoffs } from './handoffs.ts';
 import { agentId, claimTtlMs, isExpired } from './claims.ts';
 import { conflicts, formatClaim, parseClaim, type ClaimPath } from './paths.ts';
 import {
@@ -20,6 +22,7 @@ import {
 } from './store.ts';
 import {
   markCorrupt,
+  listTaskLiveStates,
   readTaskLive,
   taskLiveFile,
   transitionTask,
@@ -66,6 +69,7 @@ export interface NextResult {
   claims: ClaimRecord[];
   specCommit: string;
   recovery: RecoveryReport;
+  contract_alerts: ContractAlert[];
 }
 
 export interface NextOptions {
@@ -78,7 +82,9 @@ export interface NextOptions {
   catalog?: TaskCatalog;
 }
 
-const HELD_STATUSES: readonly string[] = ['claimed', 'in_progress', 'reported_done', 'blocked'];
+const HELD_STATUSES: readonly string[] = [
+  'claimed', 'in_progress', 'reported_done', 'verifying', 'verify_failed', 'awaiting_merge', 'blocked',
+];
 
 function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -395,7 +401,7 @@ export async function next(info: RepoInfo, options: NextOptions = {}): Promise<N
   const laneBranch = currentBranch(info.laneTop);
   const claimBranch = currentBranch(lanePath);
 
-  return withLock(
+  const acquired = await withLock(
     state,
     async () => {
       const recovery = recoverIntents(state);
@@ -427,6 +433,20 @@ export async function next(info: RepoInfo, options: NextOptions = {}): Promise<N
       ...(options.onWait === undefined ? {} : { onWait: options.onWait }),
     },
   );
+  const lives = new Map(listTaskLiveStates(state).lives.map((live) => [live.id, live] as const));
+  const contractTasks: ContractTask[] = [...catalog.specs.values()].map((spec) => {
+    const live = lives.get(spec.id);
+    return {
+      id: spec.id,
+      status: live?.status ?? 'draft',
+      reads: spec.reads,
+      touches: spec.touches,
+      assigned_lane: live?.lane ?? null,
+    };
+  });
+  const contract_alerts = buildContractAlerts(info, contractTasks, readRepositoryHandoffs(info))
+    .filter((alert) => alert.task === acquired.task.id || alert.peer_task === acquired.task.id);
+  return { ...acquired, contract_alerts };
 }
 
 /** 锁内事务本体：intent → lease → claims → committed → 清 intent。分支由调用方在锁外算好。 */

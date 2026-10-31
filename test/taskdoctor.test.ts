@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -7,8 +7,8 @@ import { test } from 'node:test';
 import { claimTtlMs } from '../src/claims.ts';
 import { repoInfo, type RepoInfo } from '../src/git.ts';
 import { parseClaim } from '../src/paths.ts';
-import { claimId, ensureState, stateRoot, writeClaim } from '../src/store.ts';
-import { readTaskLive, transitionTask } from '../src/taskstore.ts';
+import { claimId, ensureState, listClaims, stateRoot, writeClaim } from '../src/store.ts';
+import { readTaskLive, transitionM2Task, transitionTask, writeTaskLive, type VerificationLive } from '../src/taskstore.ts';
 import { doctorTasks } from '../src/taskdoctor.ts';
 import { writeIntent, type NextIntent } from '../src/tasknext.ts';
 import { removeTree } from './helpers.ts';
@@ -64,6 +64,33 @@ function meta(id: string, overrides: Record<string, unknown> = {}): Record<strin
     created_at: '2026-10-30T09:00:00.000Z',
     ...overrides,
   };
+}
+
+function seedVerifying(fixture: Fixture, id: string, pid: number | null, host: string | null, pidStartedAt: string | null): void {
+  ensureState(fixture.state);
+  const head = git(['rev-parse', 'HEAD'], fixture.root);
+  transitionTask(fixture.state, id, 'ready');
+  transitionTask(fixture.state, id, 'claimed', {
+    lane: 'alpha', lanePath: fixture.info.laneTop, agent: 'dsh', specCommit: head,
+  });
+  transitionTask(fixture.state, id, 'in_progress', { agent: 'dsh' });
+  transitionTask(fixture.state, id, 'reported_done', { agent: 'dsh' });
+  const verification: VerificationLive = {
+    run_id: `verify-${id}`, status: 'running', pid, host,
+    pid_started_at: pidStartedAt, pid_start_error: null,
+    started_at: new Date().toISOString(), finished_at: null,
+    head_before: head, head_after: null, config_commit: head,
+    summary: '', records: [],
+  };
+  transitionM2Task(fixture.state, id, 'verifying', { agent: 'dsh', verification });
+
+  const target = parseClaim(`src/${id}.ts`, fixture.info);
+  writeClaim(fixture.state, {
+    id: claimId(target), kind: target.kind, key: target.key, display: `src/${id}.ts`,
+    lane: 'alpha', lanePath: fixture.info.laneTop, branch: 'main', agentId: 'dsh',
+    pid: process.pid, host: hostname(), note: `task ${id}`,
+    createdAt: new Date().toISOString(), ttlMs: claimTtlMs(),
+  });
 }
 
 test('干净的仓库 doctor 不报任务问题', async () => {
@@ -308,6 +335,127 @@ test('同 agent 跑别的任务留下的 claim 不能让 lease 保活', async ()
     const fix = await doctorTasks(fixture.info, true);
     assert.ok(fix.fixed.some((line) => line.includes('已回收过期 lease t-00a1b2')), fix.fixed.join(' | '));
     assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'ready');
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('doctor --fix 恢复未启动、已退出或已被复用 PID 的验证并保留占位', async () => {
+  const fixture = makeRepo([
+    meta('t-00a1b2'),
+    meta('t-00b3c4'),
+    meta('t-00c5d6'),
+  ]);
+  try {
+    seedVerifying(fixture, 't-00a1b2', null, null, null);
+    seedVerifying(fixture, 't-00b3c4', process.pid, hostname(), null);
+    seedVerifying(fixture, 't-00c5d6', 2_000_000_000, hostname(), '2000-01-01T00:00:00.000Z');
+    const claimsBefore = listClaims(fixture.state).map((claim) => claim.id).sort();
+
+    const report = await doctorTasks(fixture.info, true);
+    assert.equal(report.fixed.filter((line) => line.includes('已恢复验证')).length, 3, report.fixed.join(' | '));
+    for (const id of ['t-00a1b2', 't-00b3c4', 't-00c5d6']) {
+      const live = readTaskLive(fixture.state, id);
+      assert.equal(live?.status, 'reported_done');
+      assert.equal(live?.verification?.status, 'stale');
+      assert.equal(live?.recovery?.run_id, `verify-${id}`);
+      assert.ok(Date.parse(live?.recovery?.at ?? '') > 0);
+      assert.equal(live?.lane, 'alpha');
+      assert.equal(live?.agent, 'dsh');
+      assert.equal(live?.history.at(-1)?.agent, 'doctor');
+    }
+    assert.deepEqual(listClaims(fixture.state).map((claim) => claim.id).sort(), claimsBefore);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('doctor --fix 不恢复仍存活但 pid_started_at 不可得的验证', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    windowsHide: true,
+    stdio: 'ignore',
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', resolve);
+      child.once('error', reject);
+    });
+    assert.ok(child.pid);
+    seedVerifying(fixture, 't-00a1b2', child.pid!, hostname(), null);
+
+    const report = await doctorTasks(fixture.info, true);
+    const live = readTaskLive(fixture.state, 't-00a1b2');
+    assert.equal(live?.status, 'verifying');
+    assert.equal(live?.recovery, null);
+    assert.ok(report.notices.some((line) => line.includes('pid_started_at 不可得')));
+    assert.equal(listClaims(fixture.state).length, 1);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
+      child.kill();
+      await exited;
+    }
+    fixture.cleanup();
+  }
+});
+
+test('doctor --fix 不把异机相同 PID 当成 CLI 自身进程', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  try {
+    seedVerifying(fixture, 't-00a1b2', process.pid, `${hostname()}-other`, null);
+
+    const report = await doctorTasks(fixture.info, true);
+    const live = readTaskLive(fixture.state, 't-00a1b2');
+    assert.equal(live?.status, 'verifying');
+    assert.equal(live?.recovery, null);
+    assert.ok(report.notices.some((line) => line.includes('无法检查')));
+    assert.equal(listClaims(fixture.state).length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('doctor --fix 收尾已退出但保持 blocked 的验证并保留占位', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  try {
+    seedVerifying(fixture, 't-00a1b2', 2_000_000_000, hostname(), '2000-01-01T00:00:00.000Z');
+    transitionM2Task(fixture.state, 't-00a1b2', 'blocked', { agent: 'dsh', reason: '等待外部确认' });
+    const claimsBefore = listClaims(fixture.state).map((claim) => claim.id);
+
+    const report = await doctorTasks(fixture.info, true);
+    assert.ok(report.fixed.some((line) => line.includes('收尾阻塞任务')));
+    const live = readTaskLive(fixture.state, 't-00a1b2');
+    assert.equal(live?.status, 'blocked');
+    assert.equal(live?.blocked_reason, '等待外部确认');
+    assert.equal(live?.verification?.status, 'stale');
+    assert.equal(live?.recovery?.run_id, 'verify-t-00a1b2');
+    assert.deepEqual(listClaims(fixture.state).map((claim) => claim.id), claimsBefore);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('doctor 对停留超过 24 小时的 reported_done 只提示、不改状态', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  try {
+    ensureState(fixture.state);
+    transitionTask(fixture.state, 't-00a1b2', 'ready');
+    transitionTask(fixture.state, 't-00a1b2', 'claimed', {
+      lane: 'alpha', lanePath: fixture.info.laneTop, agent: 'dsh',
+    });
+    transitionTask(fixture.state, 't-00a1b2', 'in_progress', { agent: 'dsh' });
+    const reported = transitionTask(fixture.state, 't-00a1b2', 'reported_done', { agent: 'dsh' });
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+    writeTaskLive(fixture.state, {
+      ...reported,
+      updated_at: old,
+      history: reported.history.map((entry) => entry.to === 'reported_done' ? { ...entry, at: old } : entry),
+    });
+
+    const report = await doctorTasks(fixture.info, false);
+    assert.ok(report.notices.some((line) => line.includes('reported_done 超过 24 小时')));
+    assert.equal(readTaskLive(fixture.state, 't-00a1b2')?.status, 'reported_done');
   } finally {
     fixture.cleanup();
   }

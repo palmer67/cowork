@@ -207,7 +207,8 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
 - 三块表沿用现有看板结构（工作树 / 占位 / 任务与契约），每行右侧新增操作列：
   - 车道行：[在此车道派工]（调 `/api/lane/<lane>/next`）、[查看 brief]
   - 任务行：按状态显示可用动作（ready / start / report-done / confirm-merge / block / cancel），
-    未到该状态时按钮置灰并 `title` 说明原因
+    未到该状态时按钮置灰并 `title` 说明原因；`start`/`report-done`/`block`/`cancel` 另需
+    「面板身份 == 任务 owner」这一条，否则置灰（见 R4）
   - 导入：[导入计划] → 文件路径输入框 → 调 `/api/import`
 - 每次操作后在页面底部展开一个结果条：`exit 2`、命令、stdout/stderr 原文（可折叠）。失败不弹 alert。
 - 每 2 秒 `fetch('/api/snapshot')` 刷新；`document.hidden` 时暂停。
@@ -305,3 +306,18 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
   的 `--agent` 由服务端按 lane 名填；写路由一律拒绝客户端传入的 `agent`（`400`）。理由：D11 的整个
   前提是「面板只是 CLI 的遥控器」，允许面板代为指定 agent 就等于绕过「谁占着」的身份语义，而 M1 的
   占位与租约都建立在 agent 身份上。快照里的 owner 仅供展示。
+- **R4 状态推进按钮必须绑定任务 owner（2026-10-31 复审后新增）。** `requireOwner()`
+  （`src/taskops.ts:206`）被 `start`/`report-done`/`block`/`cancel` 调用；面板在仓库根起子进程，
+  用的是面板自己的 `COWORK_AGENT_ID`（通常 `default`），与被派工任务的 `lane dsh agent dsh` 永不相等，
+  所以这四个按钮现在是死的（判官探针实测 `code=2`「start 需要持有者执行」）。裁定：**不新增任何
+  「代填身份」能力**（R3 不变），改为
+  1. `/api/snapshot` 响应增加 `panel_agent` 字段（`COWORK_AGENT_ID` 或 `default`）；
+  2. 任务行四个状态按钮仅在 `task.lane` + `task.assigned_agent` == `panel_agent` 时启用，
+     否则置灰，`title` 写「需在车道 <lane> 内由 <agent> 执行」，正文附可复制的
+     `cowork task start <id>`；
+  3. `ready` 与 `confirm-merge` 不受此限（前者是人的审核动作，后者本就是人工确认口）；
+  4. 双 README 补一句：状态推进在车道 CLI 里做，面板负责派工 / 导入 / 确认合并；
+  5. `accept-panel.mjs` 增加一条断言：对已派工任务点 `start` 时，面板要么给出启用（身份相符），
+     要么给出置灰 + 提示文案，不允许发出必然 `code=2` 的请求。
+  理由：人的点击不能等价于 agent 说「我开工了 / 我做完了」，否则 `in_progress` 与
+  `reported_done` 两个信号失去意义，M2 的自动验证也无法据此判断「谁在干活」。

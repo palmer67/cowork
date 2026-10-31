@@ -385,8 +385,8 @@ def(8, 'lane new 名字校验与重名冲突', () => {
   return done();
 });
 
-// 9. 损坏的 live 文件 → doctor exit 1，next fail closed
-def(9, '损坏 live 状态时不伪装成空', () => {
+// 9. 损坏 live 文件与半成品 intent 恢复
+def(9, '损坏 live 不伪装成空；半成品 intent 可回滚后再领取', () => {
   const root = newRepo();
   const { check, done } = makeChecker();
   const common = git(root, ['rev-parse', '--path-format=absolute', '--git-common-dir']);

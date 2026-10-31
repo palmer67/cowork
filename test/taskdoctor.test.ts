@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, utimesSync, writeFileSync } from 'node:fs';
 import { hostname, tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -72,6 +72,54 @@ test('干净的仓库 doctor 不报任务问题', async () => {
     const report = await doctorTasks(fixture.info, false);
     assert.deepEqual(report.problems, []);
     assert.deepEqual(report.fixed, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test('doctor 提示并清理过期锁临时目录与 trash 条目，但普通检查不报红', async () => {
+  const fixture = makeRepo([meta('t-00a1b2')]);
+  try {
+    ensureState(fixture.state);
+    const oldLock = new Date(Date.now() - 61_000);
+    const oldTrash = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    const lockTmp = path.join(fixture.state, 'lock.tmp-test');
+    mkdirSync(lockTmp);
+    utimesSync(lockTmp, oldLock, oldLock);
+    const trashEntry = path.join(fixture.state, 'trash', 'old-lock');
+    mkdirSync(trashEntry);
+    utimesSync(trashEntry, oldTrash, oldTrash);
+
+    const before = await doctorTasks(fixture.info, false);
+    assert.deepEqual(before.problems, []);
+    assert.equal(before.notices.length, 2);
+    assert.ok(before.notices.some((line) => line.includes('lock.tmp-test') && line.includes('60 秒')));
+    assert.ok(before.notices.some((line) => line.includes('old-lock') && line.includes('24 小时')));
+
+    const cli = path.resolve('src/cli.ts');
+    const doctor = spawnSync(process.execPath, ['--experimental-strip-types', cli, 'doctor'], {
+      cwd: fixture.root,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(doctor.status, 0, doctor.stderr);
+    assert.match(doctor.stdout, /提示: .*lock\.tmp-test/);
+    assert.match(doctor.stdout, /提示: .*old-lock/);
+
+    const fix = spawnSync(process.execPath, ['--experimental-strip-types', cli, 'doctor', '--fix'], {
+      cwd: fixture.root,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    assert.equal(fix.status, 0, fix.stderr);
+    assert.equal(existsSync(lockTmp), false);
+    assert.equal(existsSync(trashEntry), false);
+    assert.match(fix.stdout, /已删除锁临时目录/);
+    assert.match(fix.stdout, /已删除trash 残留/);
+
+    const after = await doctorTasks(fixture.info, false);
+    assert.deepEqual(after.problems, []);
+    assert.deepEqual(after.notices, []);
   } finally {
     fixture.cleanup();
   }

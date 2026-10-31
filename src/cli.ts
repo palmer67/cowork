@@ -481,6 +481,7 @@ async function runDoctor(info: RepoInfo, fix: boolean): Promise<number> {
 
   const tasks = await doctorTasks(info, fix);
   for (const line of tasks.fixed) console.log(line);
+  for (const line of tasks.notices) console.log(`提示: ${line}`);
   if (tasks.problems.length === 0) {
     console.log('任务层未发现问题。');
   } else {

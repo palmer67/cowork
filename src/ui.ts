@@ -180,7 +180,7 @@ function taskActions(task: SnapshotTask, lanes: readonly SnapshotLane[], options
     const needsOwner = action === 'start' || action === 'report-done' || action === 'block' || action === 'cancel';
     const mismatch = needsOwner && !ownerMatches;
     ownerMismatch ||= mismatch;
-    const ownerReason = `需在车道 ${task.assigned_lane ?? '未分配'} 内由 ${task.agent ?? '未分配'} 执行`;
+    const ownerReason = `需在车道 ${task.assigned_lane ?? '(main)'} 内由 ${task.agent ?? '未声明'} 执行`;
     const reason = mismatch ? ownerReason : invalidLane ? '所属车道不可用，请重开面板' : !states.includes(task.status) ? `当前 ${task.status}；仅 ${states.join(' / ')} 可用` : '';
     const form = action === 'confirm-merge' || action === 'block' || action === 'cancel' ? action : '';
     return actionButton(label, `/api/task/${encodeURIComponent(task.id)}/${action}`, `cowork task ${action} ${task.id}`, true, reason, form);
@@ -199,11 +199,8 @@ function renderTasks(tasks: readonly SnapshotTask[], lanes: readonly SnapshotLan
   }
   const rows = tasks
     .map((task) => {
-      const lane =
-        task.assigned_lane === null
-          ? '<span class="sub">(未领取)</span>'
-          : `<span class="mono">${escapeHtml(task.assigned_lane)}</span>`;
-      const agent = task.agent === null ? '' : `<div class="sub mono">${escapeHtml(task.agent)}</div>`;
+      const lane = `<span class="mono">${escapeHtml(task.assigned_lane ?? '(main)')}</span>`;
+      const agent = `<div class="sub mono">${escapeHtml(task.agent ?? '未声明')}</div>`;
       const blocked =
         task.blocked_reason === null
           ? ''

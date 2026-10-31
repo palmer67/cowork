@@ -313,7 +313,7 @@ cowork task import <plan.json> [--dry-run] [--ready]   # 新增：计划 → dra
   「代填身份」能力**（R3 不变），改为
   1. `/api/snapshot` 响应增加 `panel_agent` 字段（`COWORK_AGENT_ID` 或 `default`）；
   2. 任务行四个状态按钮仅在 `task.lane` + `task.assigned_agent` == `panel_agent` 时启用，
-     否则置灰，`title` 写「需在车道 <lane> 内由 <agent> 执行」，正文附可复制的
+     否则置灰，`title` 写「需在车道 <lane> 内由 <agent> 执行」（主工作树显示为 `(main)`，未声明 agent 显示为 `未声明`），正文附可复制的
      `cowork task start <id>`；
   3. `ready` 与 `confirm-merge` 不受此限（前者是人的审核动作，后者本就是人工确认口）；
   4. 双 README 补一句：状态推进在车道 CLI 里做，面板负责派工 / 导入 / 确认合并；

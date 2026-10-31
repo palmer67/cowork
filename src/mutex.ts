@@ -1,4 +1,14 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  rmdirSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { hostname } from 'node:os';
 import path from 'node:path';
 import { CoworkError, EXIT, busy } from './errors.ts';
@@ -57,18 +67,43 @@ function readOwner(lockDir: string): LockOwner | null {
   }
 }
 
-function tryAcquire(lockDir: string): LockOwner | null {
+/** 抢锁过程中可以安全重试的错误码：Windows 的 delete-pending 常报 EPERM/ENOENT。 */
+const CONTENTION_CODES = new Set(['EPERM', 'EEXIST', 'ENOENT', 'ENOTEMPTY', 'EBUSY']);
+
+function errCode(err: unknown): string | undefined {
+  return (err as NodeJS.ErrnoException).code;
+}
+
+/** 清理临时目录/trash：失败不影响互斥语义，锁路径已经让出来了。 */
+function removeTree(dir: string): void {
   try {
-    mkdirSync(lockDir);
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST') return null;
-    throw new CoworkError(
-      EXIT.GENERAL,
-      `无法创建锁目录 ${lockDir}: ${code ?? String(err)}`,
-      '检查状态目录是否可写、父路径是否是目录；修好后再重试。',
-    );
+    rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+  } catch {
+    // 留给 doctor --fix 收尾。
   }
+}
+
+function trashTarget(stateRoot: string, prefix: string): string {
+  return path.join(
+    stateRoot,
+    'trash',
+    `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  );
+}
+
+/**
+ * 一次原子发布：owner.json 先写进 lock.tmp-<pid>-<rand>，再 rename 成 lock。
+ * rename 是原子的，别人要么看到完整的锁，要么什么都看不到——不存在
+ * "目录已建、owner.json 还没写"的窗口，也不会出现 mkdir 成功但写 owner 拿到 ENOENT。
+ *
+ * 目标已存在（Windows 报 EPERM/EEXIST）就当作被占用：删掉自己的临时目录，继续等待。
+ * 绝不因为并发窗口直接抛错退出。
+ */
+function tryAcquire(lockDir: string, stateRoot: string): LockOwner | null {
+  const tmp = path.join(
+    stateRoot,
+    `lock.tmp-${process.pid}-${Math.random().toString(36).slice(2, 10)}`,
+  );
   const owner: LockOwner = {
     pid: process.pid,
     host: hostname(),
@@ -76,13 +111,45 @@ function tryAcquire(lockDir: string): LockOwner | null {
     acquiredAt: new Date().toISOString(),
   };
   try {
-    writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify(owner), 'utf8');
+    mkdirSync(tmp);
+    writeFileSync(path.join(tmp, 'owner.json'), JSON.stringify(owner), 'utf8');
   } catch (err) {
-    rmSync(lockDir, { recursive: true, force: true });
+    removeTree(tmp);
+    const code = errCode(err);
+    if (code === 'ENOENT') {
+      // 状态目录在等待期间被删/被回收：补建一次，下一轮再试。
+      try {
+        mkdirSync(stateRoot, { recursive: true });
+      } catch {
+        // 还是建不出来就继续等，超时后按占用报错，不在这里伪装成致命错误。
+      }
+      return null;
+    }
+    if (code !== undefined && CONTENTION_CODES.has(code)) return null;
     throw new CoworkError(
       EXIT.GENERAL,
-      `无法写入 owner.json: ${String(err)}`,
-      '检查状态目录的磁盘权限与剩余空间。',
+      `无法准备锁目录 ${tmp}: ${code ?? String(err)}`,
+      '检查状态目录是否可写、父路径是否是目录；修好后再重试。',
+    );
+  }
+  try {
+    renameSync(tmp, lockDir);
+  } catch (err) {
+    removeTree(tmp);
+    const code = errCode(err);
+    if (code === 'ENOENT') {
+      try {
+        mkdirSync(stateRoot, { recursive: true });
+      } catch {
+        // 同上，交给等待与超时。
+      }
+      return null;
+    }
+    if (code !== undefined && CONTENTION_CODES.has(code)) return null;
+    throw new CoworkError(
+      EXIT.GENERAL,
+      `无法发布锁目录 ${lockDir}: ${code ?? String(err)}`,
+      '检查状态目录的权限与磁盘空间；修好后重试，反复失败时运行 cowork doctor --fix。',
     );
   }
   return owner;
@@ -90,7 +157,7 @@ function tryAcquire(lockDir: string): LockOwner | null {
 
 function isStale(lockDir: string, owner: LockOwner | null): boolean {
   if (owner === null) {
-    // 目录已建但 owner.json 还没写：可能是刚抢到锁的瞬间，也可能是崩溃。
+    // 原子发布下"目录在、owner 缺失"基本只剩损坏或旧版本残留，给 5 秒让位后回收。
     try {
       return Date.now() - statSync(lockDir).mtimeMs > 5_000;
     } catch {
@@ -103,17 +170,31 @@ function isStale(lockDir: string, owner: LockOwner | null): boolean {
   return !pidAlive(owner.pid);
 }
 
-/** 把残留锁挪到 trash，避免直接删除时与别人竞争。 */
-function reap(lockDir: string, stateRoot: string): void {
-  const trash = path.join(stateRoot, 'trash');
-  mkdirSync(trash, { recursive: true });
-  const target = path.join(trash, `lock-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+/**
+ * 回收残留锁：先把 lock 整体 rename 到 trash（原子操作，且立刻把 lock 路径让出来），
+ * 再在 trash 里删除。绝不在 lock 路径上直接 rmSync —— Windows 的 delete-pending
+ * 会让下一个进程的 rename/mkdir 撞上 EPERM。
+ *
+ * stale 是判定回收时看到的持有者（null 表示 owner.json 缺失）。真正 rename 前再读一次：
+ * 如果别的进程已经回收并发布了新锁，token 会变，必须放弃，不能把别人的新锁挪走。
+ */
+function reap(lockDir: string, stateRoot: string, stale: LockOwner | null): void {
+  const current = readOwner(lockDir);
+  if (stale === null ? current !== null : current === null || current.token !== stale.token) {
+    return;
+  }
+  const target = trashTarget(stateRoot, 'lock');
+  try {
+    mkdirSync(path.join(stateRoot, 'trash'), { recursive: true });
+  } catch {
+    return;
+  }
   try {
     renameSync(lockDir, target);
   } catch {
-    return; // 别人已经清掉了
+    return; // 别人已经回收，或 lock 已不存在
   }
-  rmSync(target, { recursive: true, force: true });
+  removeTree(target);
 }
 
 function describe(owner: LockOwner | null): string {
@@ -125,15 +206,38 @@ function describe(owner: LockOwner | null): string {
  * 释放锁前核对 token：如果锁已被回收并被别人重建，旧持有者绝不能删掉新锁。
  * 这种情况说明本次临界区并没有独占，必须显式说出来，而不是假装正常结束。
  */
-function releaseLock(lockDir: string, own: LockOwner): void {
+function releaseLock(lockDir: string, stateRoot: string, own: LockOwner): void {
   const current = readOwner(lockDir);
-  if (current !== null && current.token === own.token) {
-    rmSync(lockDir, { recursive: true, force: true });
+  if (current === null || current.token !== own.token) {
+    console.warn(
+      `cowork: 锁已被回收，本次未独占: ${lockDir}（当前持有者: ${describe(current)}）。未删除他人锁。`,
+    );
     return;
   }
-  console.warn(
-    `cowork: 锁已被回收，本次未独占: ${lockDir}（当前持有者: ${describe(current)}）。未删除他人锁。`,
-  );
+  const target = trashTarget(stateRoot, 'lock');
+  try {
+    mkdirSync(path.join(stateRoot, 'trash'), { recursive: true });
+  } catch {
+    // rename 到 trash 失败时还有下面的单文件兜底。
+  }
+  try {
+    renameSync(lockDir, target);
+  } catch (err) {
+    if (errCode(err) === 'ENOENT') return; // 已经不在了，没有要释放的
+    // 极少数 delete-pending 场景：退化为单文件 unlink + rmdir，不递归删除目录。
+    try {
+      unlinkSync(path.join(lockDir, 'owner.json'));
+      rmdirSync(lockDir);
+    } catch (fallbackErr) {
+      if (errCode(fallbackErr) !== 'ENOENT') {
+        console.warn(
+          `cowork: 释放锁失败: ${lockDir}（${errCode(fallbackErr) ?? String(fallbackErr)}）；运行 cowork doctor --fix 清理。`,
+        );
+      }
+    }
+    return;
+  }
+  removeTree(target);
 }
 
 /**
@@ -173,20 +277,20 @@ export async function withLock<T>(
   let notified = false;
 
   for (;;) {
-    const owner = tryAcquire(lockDir);
+    const owner = tryAcquire(lockDir, stateRoot);
     if (owner !== null) {
       held.add(lockDir);
       try {
         return await fn();
       } finally {
         held.delete(lockDir);
-        releaseLock(lockDir, owner);
+        releaseLock(lockDir, stateRoot, owner);
       }
     }
 
     const current = readOwner(lockDir);
     if (isStale(lockDir, current)) {
-      reap(lockDir, stateRoot);
+      reap(lockDir, stateRoot, current);
       continue;
     }
 

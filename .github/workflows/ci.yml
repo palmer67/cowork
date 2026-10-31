@@ -10,7 +10,8 @@ on:
     - cron: '17 3 * * 1'
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # 手动/定时跑压测时不能被一次 push 顶掉，所以按事件分开分组
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 defaults:

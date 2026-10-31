@@ -621,7 +621,11 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
       for (const task of result.tasks) console.log(`  ${task.key.padEnd(18)} → ${task.id}`);
       console.log('依赖:');
       for (const task of result.tasks) for (const dep of task.depends_on) console.log(`  ${task.id} depends_on ${dep}`);
-      if (result.dryRun) console.log('（dry-run：未写入文件）');
+      if (result.dryRun) {
+        console.log('将要写入:');
+        for (const task of result.tasks) console.log(`  ${path.relative(info.mainRoot, task.path)}`);
+        console.log('（dry-run：未写入文件）');
+      }
       else console.log('下一步: git add .cowork/tasks && git commit -m "task: …"，然后 cowork task ready <id>');
       if (args.flags.has('ready')) for (const task of result.tasks) console.log(`  cowork task ready ${task.id}`);
       return EXIT.OK;

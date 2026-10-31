@@ -1,13 +1,11 @@
-import { randomBytes } from 'node:crypto';
 import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { stateRoot } from './store.ts';
 import { withLock } from './mutex.ts';
 import { formatClaim, parseClaim } from './paths.ts';
-import { renderTaskSpec, specDir, type TaskSpec } from './tasks.ts';
+import { newTaskId, renderTaskSpec, specDir, type TaskSpec } from './tasks.ts';
 
 export interface PlanTask {
   key: string;
@@ -47,10 +45,10 @@ function stringField(value: unknown, name: string, index: number, allowEmpty = f
 
 function stringArray(value: unknown, name: string, index: number): string[] {
   if (value === undefined) return [];
-  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string' || item.trim() === '')) {
     issue(`tasks[${index}].${name} 必须是字符串数组`);
   }
-  return (value as string[]).map((item) => item.trim()).filter((item) => item !== '');
+  return (value as string[]).map((item) => item.trim());
 }
 
 function parsePlan(text: string): PlanTask[] {
@@ -62,42 +60,36 @@ function parsePlan(text: string): PlanTask[] {
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) issue('根对象必须是 JSON 对象');
   const root = value as Record<string, unknown>;
-  if (root['schemaVersion'] !== 1) issue('schemaVersion 必须是 1');
-  if (!Array.isArray(root['tasks']) || root['tasks'].length === 0) issue('tasks 必须是非空数组');
-
   const tasks: PlanTask[] = [];
   const problems: string[] = [];
+  if (root['schemaVersion'] !== 1) problems.push('schemaVersion 必须是 1');
+  if (!Array.isArray(root['tasks']) || root['tasks'].length === 0) problems.push('tasks 必须是非空数组');
+  const rawTasks: unknown[] = Array.isArray(root['tasks']) ? root['tasks'] : [];
+  const collect = <T>(parse: () => T, fallback: T): T => {
+    try { return parse(); } catch (err) { problems.push(errorMessage(err)); return fallback; }
+  };
   const keys = new Set<string>();
-  for (let index = 0; index < (root['tasks'] as unknown[]).length; index += 1) {
-    const raw = (root['tasks'] as unknown[])[index];
+  for (let index = 0; index < rawTasks.length; index += 1) {
+    const raw = rawTasks[index];
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
       problems.push(`tasks[${index}] 必须是对象`);
       continue;
     }
     const item = raw as Record<string, unknown>;
-    let key: string;
-    let title: string;
-    let body: string;
-    let touches: string[];
-    let reads: string[];
-    let depends_on: string[];
-    let done_when: string[];
-    try { key = stringField(item['key'], 'key', index); } catch (err) { problems.push(errorMessage(err)); continue; }
+    const key = collect(() => stringField(item['key'], 'key', index), '');
     if (!KEY.test(key)) problems.push(`tasks[${index}].key 格式无效: ${key}`);
     if (keys.has(key)) problems.push(`key 重复: ${key}`);
     keys.add(key);
-    try { title = stringField(item['title'], 'title', index); } catch (err) { problems.push(errorMessage(err)); continue; }
+    const title = collect(() => stringField(item['title'], 'title', index), '');
     if ([...title].length > 120) problems.push(`tasks[${index}].title 超过 120 字符`);
-    try { touches = stringArray(item['touches'], 'touches', index); } catch (err) { problems.push(errorMessage(err)); continue; }
+    const touches = collect(() => stringArray(item['touches'], 'touches', index), []);
     if (touches.length === 0) problems.push(`tasks[${index}].touches 不能为空`);
-    try { reads = stringArray(item['reads'], 'reads', index); } catch (err) { problems.push(errorMessage(err)); continue; }
+    const reads = collect(() => stringArray(item['reads'], 'reads', index), []);
     const overlap = touches.find((entry) => reads.includes(entry));
     if (overlap !== undefined) problems.push(`tasks[${index}] 路径同时出现在 touches 与 reads: ${overlap}`);
-    try {
-      body = stringField(item['body'] ?? '', 'body', index, true);
-      depends_on = stringArray(item['depends_on'], 'depends_on', index);
-      done_when = stringArray(item['done_when'], 'done_when', index);
-    } catch (err) { problems.push(errorMessage(err)); continue; }
+    const body = collect(() => stringField(item['body'] === undefined ? '' : item['body'], 'body', index, true), '');
+    const depends_on = collect(() => stringArray(item['depends_on'], 'depends_on', index), []);
+    const done_when = collect(() => stringArray(item['done_when'], 'done_when', index), []);
     tasks.push({ key, title, body, touches, reads, depends_on, done_when });
   }
 
@@ -134,22 +126,13 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message.replace(/^计划导入失败: /, '') : String(err);
 }
 
-function newId(title: string, createdAt: string, taken: Set<string>): string {
-  for (let attempt = 0; attempt < 64; attempt += 1) {
-    const salt = randomBytes(8).toString('hex');
-    const hex = createHash('sha256').update(`${title}\n${createdAt}\n${salt}`).digest('hex');
-    const id = `t-${hex.slice(0, 6)}`;
-    if (!taken.has(id)) return id;
-  }
-  issue('无法分配任务 id', '稍后重试。');
-}
-
 function existingIds(dir: string): Set<string> {
   // IDs are only used to avoid collisions; malformed filenames are harmless here.
   try {
     return new Set(readdirSync(dir).filter((name) => /^t-[0-9a-f]{6}\.md$/.test(name)).map((name) => name.slice(0, -3)));
-  } catch {
-    return new Set();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return new Set();
+    issue(`无法读取任务目录 ${dir}: ${errorMessage(err)}`);
   }
 }
 
@@ -160,17 +143,24 @@ export async function importPlan(info: RepoInfo, file: string, options: { dryRun
   } catch (err) {
     issue(`无法读取 ${file}: ${err instanceof Error ? err.message : String(err)}`);
   }
-  const tasks = parsePlan(text).map((task) => ({
-    ...task,
-    touches: task.touches.map((raw) => formatClaim(parseClaim(raw, info))),
-    reads: task.reads.map((raw) => formatClaim(parseClaim(raw, info))),
-  }));
+  const pathProblems: string[] = [];
+  const tasks = parsePlan(text).map((task) => {
+    const normalize = (entries: string[]): string[] => entries.map((raw) => {
+      try { return formatClaim(parseClaim(raw, info)); }
+      catch (err) { pathProblems.push(`${task.key}: ${errorMessage(err)}`); return raw; }
+    });
+    const touches = normalize(task.touches);
+    const reads = normalize(task.reads);
+    for (const entry of touches) if (reads.includes(entry)) pathProblems.push(`${task.key} 路径同时出现在 touches 与 reads: ${entry}`);
+    return { ...task, touches, reads };
+  });
+  if (pathProblems.length > 0) issue(pathProblems.join('\n- '));
   const createdAt = new Date().toISOString();
   const dir = specDir(info);
   const taken = existingIds(dir);
   const ids = new Map<string, string>();
   for (const task of tasks) {
-    const id = newId(task.title, createdAt, taken);
+    const id = newTaskId(task.title, createdAt, taken);
     taken.add(id);
     ids.set(task.key, id);
   }
@@ -203,10 +193,11 @@ export async function importPlan(info: RepoInfo, file: string, options: { dryRun
         written.push(spec.path);
       }
     } catch (err) {
+      const rollbackErrors: string[] = [];
       for (const filePath of written) {
-        try { unlinkSync(filePath); } catch { /* best effort rollback */ }
+        try { unlinkSync(filePath); } catch (rollbackError) { rollbackErrors.push(`${filePath}: ${errorMessage(rollbackError)}`); }
       }
-      issue(`写入任务规格失败（${err instanceof Error ? err.message : String(err)}）`, '本批次已回滚，请检查 .cowork/tasks 是否可写。');
+      issue(`写入任务规格失败（${errorMessage(err)}）`, rollbackErrors.length === 0 ? '本批次已回滚，请检查 .cowork/tasks 是否可写。' : `回滚失败，需人工处理: ${rollbackErrors.join('; ')}`);
     }
   }, { createStateDir: false });
   return { tasks: specs.map((spec, i) => ({ key: tasks[i]!.key, id: spec.id, depends_on: spec.depends_on, path: spec.path })), specs, dryRun: false };

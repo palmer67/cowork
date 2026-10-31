@@ -32,6 +32,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: 取到 main 作验收基线
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
@@ -62,6 +65,9 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
+
+      - name: 取到 main 作验收基线
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
 
       - uses: actions/setup-node@v5
         with:

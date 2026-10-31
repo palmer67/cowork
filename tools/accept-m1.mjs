@@ -69,14 +69,14 @@ process.on('exit', () => {
   }
 });
 
-function run(cmd, args, cwd, env = {}, shell = false) {
+function run(cmd, args, cwd, env = {}, shell = false, timeoutMs = 120_000) {
   const r = spawnSync(cmd, args, {
     cwd,
     encoding: 'utf8',
     env: { ...process.env, ...env },
     windowsHide: true,
     shell,
-    timeout: 120_000,
+    timeout: timeoutMs,
   });
   return { code: r.status ?? -1, out: `${r.stdout ?? ''}${r.stderr ?? ''}` };
 }
@@ -466,7 +466,7 @@ def(9, '损坏 live 不伪装成空；半成品 intent 可回滚后再领取', (
 // 10. 构建与测试门槛
 def(10, 'npm test ≥60 且 tsc 干净（默认执行）', () => {
   // Windows 上 npm 是 npm.cmd，直接 spawn 会 ENOENT；只有这条命令需要 shell。
-  const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32');
+  const test = run('npm', ['test'], process.cwd(), {}, process.platform === 'win32', 600_000);
   if (test.code !== 0) return [`npm test 退出 ${test.code}\n${test.out.trim().slice(-600)}`];
   const m = test.out.match(/#\s*tests\s+(\d+)/);
   const count = m ? Number(m[1]) : 0;

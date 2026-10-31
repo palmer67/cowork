@@ -1,8 +1,8 @@
 name: ci
 
 on:
+  # 任意分支的 push 都跑门禁：实现方在自己的车道分支上就能看到红绿
   push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:

@@ -65,6 +65,18 @@ DSH 默认装了写保护插件（`dsh-fs-observation-policy`）：**覆盖或�
 - Conventional Commits：`feat:`、`fix:`、`docs:`、`test:`、`chore:`。
 - 一个提交只做一件事；涉及 Windows 语义的修复要在提交正文写明复现路径。
 
+## CI（自动化门禁）
+
+- 任意分支 push 都会在 GitHub Actions 的 `windows-latest` 上跑门禁：
+  `npm test` → `npx tsc --noEmit` → `npm run build` → `node tools/accept-m1.mjs`
+  → `node tools/accept-panel.mjs`。配置在 `.github/workflows/ci.yml`。
+- 实现方**报完成之前先看 CI**：`gh run list --branch <你的分支> --limit 1`，贴出那次运行的链接与结论。
+  红的不许说"完成"；红的原因要么修掉，要么在交接单里写清"已复现、待谁处理"。
+- 判官合并前仍会在合并树上本地重跑一遍——CI 绿只说明那份提交在 runner 上过，不替代合并后的复验。
+- 每周一 11:17（北京时间）额外跑 20 轮多进程压测；要立刻复现竞态，可手动
+  `gh workflow run ci.yml`。
+- 推送即触发，所以不要为了"看看 CI"去推半成品到 `main`；在自己的车道分支上推即可。
+
 ## 分工
 
 - **大量代码实现交给 Codex**：功能开发、重构、批量修复、测试补齐，都在 Codex 自己的车道里写。

@@ -17,6 +17,7 @@ const cli = path.join(project, 'dist', 'cli.js');
 if (!existsSync(cli)) { console.error('找不到 dist/cli.js；请先 npm run build。'); process.exit(2); }
 const args = process.argv.slice(2);
 const only = args.includes('--only') ? args[args.indexOf('--only') + 1].split(',').map(Number) : null;
+const skipSuite = process.env.COWORK_ACCEPT_SKIP_SUITE === '1';
 const env = { ...process.env, COWORK_AGENT_ID: 'panel-operator' };
 // 只限本脚本子进程，不改用户 Git 配置；避免 Windows init symlink 探测留下不可删 reparse 文件。
 if (process.platform === 'win32') {
@@ -210,15 +211,18 @@ try {
     assert.match(html, /复制命令/); assert.match(html, /任务与契约/); assert.doesNotMatch(html, /fetch\(|data-api=|<dialog/);
   });
   await stop();
-  await check(13, 'npm test / tsc 通过；零运行时依赖与架构门禁', async () => {
+  await check(13, skipSuite ? '外部门禁已跑：npm test / tsc 由 CI 独立步骤执行' : 'npm test / tsc 通过；零运行时依赖与架构门禁', async () => {
     const pkg = JSON.parse(readFileSync(path.join(project, 'package.json'), 'utf8')); assert.equal(Object.keys(pkg.dependencies ?? {}).length, 0);
-    const tests = run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], project);
-    // Windows .cmd 不能由无 shell 的 spawnSync 直接启动；使用 Node 运行 npm 官方入口。
-    const npmEntry = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
-    const testResult = tests.error?.code === 'EINVAL' || tests.error?.code === 'ENOENT' ? run(process.execPath, [npmEntry, 'test'], project) : tests;
-    success(testResult); assert.match(testResult.stdout, /# fail 0/);
-    const tsc = run(process.execPath, [path.join(project, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit'], project);
-    success(tsc); assert.equal(tsc.stdout + tsc.stderr, '');
+    if (!skipSuite) {
+      const tests = run(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['test'], project);
+      // Windows .cmd 不能由无 shell 的 spawnSync 直接启动；使用 Node 运行 npm 官方入口。
+      const npmEntry = path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      const testResult = tests.error?.code === 'EINVAL' || tests.error?.code === 'ENOENT' ? run(process.execPath, [npmEntry, 'test'], project) : tests;
+      success(testResult); assert.match(testResult.stdout, /# fail 0/);
+      const tsc = run(process.execPath, [path.join(project, 'node_modules', 'typescript', 'bin', 'tsc'), '--noEmit'], project);
+      success(tsc); assert.equal(tsc.stdout + tsc.stderr, '');
+      console.log(`  ${testResult.stdout.match(/# tests \d+/)?.[0]}; # fail 0; tsc: silent; dependencies: 0`);
+    }
     // 判基线：本地 main 优先（CI 的单分支 checkout 没有它），退到 origin/main
     const baseRef = ['main', 'origin/main'].find((ref) => run('git', ['-C', project, 'rev-parse', '--verify', '--quiet', `${ref}^{commit}`], project).code === 0);
     assert.ok(baseRef, '找不到 main 分支（本地或 origin/main）');
@@ -226,7 +230,6 @@ try {
     success(architecture); assert.equal(architecture.stdout, '');
     const source = readFileSync(path.join(project, 'src', 'uiserver.ts'), 'utf8'); assert.doesNotMatch(source, /writeFileSync|renameSync/);
     for (const name of readdirSync(path.join(project, 'src')).filter((s) => s.endsWith('.ts'))) assert.ok(!readFileSync(path.join(project, 'src', name), 'utf8').includes('0.0.0.0'));
-    console.log(`  ${testResult.stdout.match(/# tests \d+/)?.[0]}; # fail 0; tsc: silent; dependencies: 0`);
   });
 } catch (err) { failed++; console.error(`FAIL setup/cleanup: ${err.stack ?? err}`); }
 finally {

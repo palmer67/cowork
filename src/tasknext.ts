@@ -1,7 +1,7 @@
 import { hostname } from 'node:os';
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { busy, general } from './errors.ts';
+import { busy, general, pathError } from './errors.ts';
 import { currentBranch, type RepoInfo } from './git.ts';
 import { withLock } from './mutex.ts';
 import { buildContractAlerts, type ContractAlert, type ContractTask } from './contracts.ts';
@@ -170,7 +170,9 @@ export function writeIntent(state: string, intent: NextIntent): void {
     writeFileSync(tmp, `${JSON.stringify(intent, null, 2)}\n`, 'utf8');
     renameSync(tmp, file);
   } catch (err) {
-    rmSync(tmp, { force: true });
+    try { rmSync(tmp, { force: true }); } catch { /* 保留原始路径错误。 */ }
+    const tooLong = pathError(err, file);
+    if (tooLong !== null) throw tooLong;
     throw general(`无法写入 next intent: ${file}（${message(err)}）`, '检查 .git/cowork/tasks/intents 是否可写。');
   }
 }

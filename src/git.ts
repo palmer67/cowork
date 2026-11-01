@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { CoworkError, EXIT } from './errors.ts';
+import { CoworkError, EXIT, pathError } from './errors.ts';
 
 export interface RepoInfo {
   /** 当前工作树根（可能是 .cowork/lanes/<name>）。 */
@@ -20,11 +20,14 @@ function run(args: string[], cwd: string): string {
       cwd,
       encoding: 'utf8',
       windowsHide: true,
+      shell: false,
       maxBuffer: 64 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     return out.replace(/\r?\n$/, '');
   } catch (err) {
+    const tooLong = pathError(err, cwd);
+    if (tooLong !== null) throw tooLong;
     const e = err as { stderr?: Buffer | string; message?: string };
     const stderr = e.stderr === undefined ? '' : Buffer.from(e.stderr).toString('utf8');
     const detail = (stderr || e.message || '').trim();
@@ -44,7 +47,9 @@ export function git(args: string[], cwd = process.cwd()): string {
 export function gitTry(args: string[], cwd = process.cwd()): string | null {
   try {
     return run(args, cwd);
-  } catch {
+  } catch (err) {
+    const tooLong = pathError(err, cwd);
+    if (tooLong !== null) throw tooLong;
     return null;
   }
 }

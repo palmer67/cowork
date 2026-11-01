@@ -161,7 +161,8 @@ export async function addTask(info: RepoInfo, input: AddTaskInput): Promise<Task
       throw general(`依赖的任务已取消: ${dep}（${depSpec.title}）`, '换一个依赖，或取消本条任务后重建。');
     }
   }
-  return withTaskLock(info, () => createSpec(info, input), false);
+  // spec 的路径规范化/磁盘写入不占用 live 锁；wx 分配保证 id 不被覆盖。
+  return createSpec(info, input);
 }
 
 export async function listTasks(info: RepoInfo, statusFilter: string | null): Promise<TaskListView> {
@@ -421,7 +422,7 @@ export interface BriefInput {
   catalog: TaskCatalog;
 }
 
-/** 只读开工摘要：锁内短读 live/claims，catalog 已在锁外读好。 */
+/** 只读开工摘要：逐文件采样，不取锁、不恢复 intent。 */
 export async function brief(info: RepoInfo, input: BriefInput): Promise<string> {
   const catalog = input.catalog;
   const localSpecs = listLocalSpecs(info).specs;
@@ -430,95 +431,75 @@ export async function brief(info: RepoInfo, input: BriefInput): Promise<string> 
   const repoHandoffs = readRepositoryHandoffs(info);
   const recent = recentHandoffs(info);
   const state = stateRoot(info);
-  return withLock(
-    state,
-    async () => {
-      recoverIntents(state);
-      const lives = new Map<string, TaskLive>();
-      for (const live of listTaskLiveStates(state).lives) lives.set(live.id, live);
-      const claims = listClaims(state);
-      const mine = lives.get(
-        [...lives.values()].find(
-          (live) =>
-            live.lanePath === info.laneTop &&
-            live.status !== 'merged' &&
-            live.status !== 'cancelled' &&
-            live.status !== 'corrupt',
-        )?.id ?? '',
-      );
-      const lines: string[] = [];
-      lines.push(`# 开工摘要（agent=${input.agent}，lane=${info.laneName ?? '(main)'}）`);
-      lines.push('');
-      if (mine === undefined) {
-        lines.push('本 lane 当前没有任务。用 cowork next 领取一个 ready 任务。');
-      } else {
-        const spec = specs.get(mine.id);
-        const statusLabel = mine.status === 'reported_done' ? 'reported_done / 未验证' : mine.status;
-        lines.push(`本 lane 任务: ${mine.id} ${spec?.title ?? '(spec 不在 trunk)'}（${statusLabel}）`);
-        if (spec !== undefined) {
-          lines.push(`  touches: ${spec.touches.join(', ') || '(空)'}`);
-          lines.push(`  reads: ${spec.reads.join(', ') || '(空)'}`);
-          lines.push(`  done_when: ${spec.done_when.join('; ') || '(空)'}`);
-          lines.push(`  spec_commit: ${mine.spec_commit ?? '(无)'}`);
-          if (mine.verification !== null) {
-            const latest = mine.verification.records.at(-1);
-            lines.push(`  verification: ${mine.verification.status}（config_commit ${mine.verification.config_commit}）`);
-            if (latest !== undefined) lines.push(`  最近检查: ${latest.name} exit=${String(latest.exit)} duration=${latest.duration_ms}ms`);
-            if (mine.verification.summary !== '') lines.push(`  摘要: ${mine.verification.summary}`);
-          }
-          lines.push('依赖:');
-          if (spec.depends_on.length === 0) lines.push('  (无)');
-          for (const dep of spec.depends_on) {
-            const depLive = lives.get(dep);
-            const status = depLive?.status ?? 'draft';
-            const holder =
-              depLive?.agent === null || depLive?.agent === undefined ? '' : `，agent ${depLive.agent}`;
-            lines.push(`  ${dep}: ${status}${holder}${status === 'merged' ? '（已满足）' : '（未满足）'}`);
-          }
-        }
-      }
-      lines.push('');
-      lines.push('本 lane 占位:');
-      const laneClaims = claims.filter((record) => record.lanePath === info.laneTop);
-      if (laneClaims.length === 0) lines.push('  (无)');
-      for (const record of laneClaims) {
-        lines.push(`  ${record.display}  agent=${record.agentId}  到期 ${record.createdAt}`);
-      }
-      lines.push('');
-      lines.push('跨 lane 冲突（与本单位置重叠的 claim）:');
-      const own = (mine === undefined ? [] : (catalog.specs.get(mine.id)?.touches ?? [])).map((touch) =>
-        parseClaim(touch, info),
-      );
-      const clashes = claims.filter(
-        (record) => record.lanePath !== info.laneTop && own.some((path) => conflicts(path, parseClaim(record.display, info))),
-      );
-      if (clashes.length === 0) lines.push('  (无)');
-      for (const record of clashes) {
-        lines.push(`  ${record.display}  lane=${record.lane ?? '(main)'} agent=${record.agentId}`);
-      }
-      lines.push('');
-      lines.push('契约提醒（本 lane 相关）:');
-      const contractTasks: ContractTask[] = [...specs.values()].map((spec) => {
-        const live = lives.get(spec.id);
-        return { id: spec.id, status: live?.status ?? 'draft', reads: spec.reads, touches: spec.touches, assigned_lane: live?.lane ?? null };
-      });
-      const alerts = buildContractAlerts(info, contractTasks, repoHandoffs).filter((alert) => alert.task === mine?.id || alert.peer_task === mine?.id);
-      lines.push(alerts.length === 0 ? '  (无)' : alerts.map((alert) => {
-        const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
-        return `  ${alert.kind}: ${alert.path} ← ${source || alert.summary}${source ? `（${alert.summary}）` : ''}`;
-      }).join('\n'));
-      lines.push('');
-      lines.push('最近交接单:');
-      if (recent.length === 0) lines.push('  (无)');
-      for (const handoff of recent) {
-        lines.push(`  ${handoff.id}  ${handoff.at}  ${handoff.title}`);
-      }
-      lines.push('');
-      lines.push('硬规则: 只改 touches 内的文件；越界前先 cowork claim 扩范围。');
-      return lines.join('\n');
-    },
-    { createStateDir: false },
+  const lives = new Map<string, TaskLive>();
+  for (const live of listTaskLiveStates(state).lives) lives.set(live.id, live);
+  const claims = listClaims(state);
+  const mine = lives.get(
+    [...lives.values()].find(
+      (live) => live.lanePath === info.laneTop && !['merged', 'cancelled', 'corrupt'].includes(live.status),
+    )?.id ?? '',
   );
+  const lines: string[] = [];
+  lines.push(`# 开工摘要（agent=${input.agent}，lane=${info.laneName ?? '(main)'}）`);
+  lines.push('');
+  if (mine === undefined) {
+    lines.push('本 lane 当前没有任务。用 cowork next 领取一个 ready 任务。');
+  } else {
+    const spec = specs.get(mine.id);
+    const statusLabel = mine.status === 'reported_done' ? 'reported_done / 未验证' : mine.status;
+    lines.push(`本 lane 任务: ${mine.id} ${spec?.title ?? '(spec 不在 trunk)'}（${statusLabel}）`);
+    if (spec !== undefined) {
+      lines.push(`  touches: ${spec.touches.join(', ') || '(空)'}`);
+      lines.push(`  reads: ${spec.reads.join(', ') || '(空)'}`);
+      lines.push(`  done_when: ${spec.done_when.join('; ') || '(空)'}`);
+      lines.push(`  spec_commit: ${mine.spec_commit ?? '(无)'}`);
+      if (mine.verification !== null) {
+        const latest = mine.verification.records.at(-1);
+        lines.push(`  verification: ${mine.verification.status}（config_commit ${mine.verification.config_commit}）`);
+        if (latest !== undefined) lines.push(`  最近检查: ${latest.name} exit=${String(latest.exit)} duration=${latest.duration_ms}ms`);
+        if (mine.verification.summary !== '') lines.push(`  摘要: ${mine.verification.summary}`);
+      }
+      lines.push('依赖:');
+      if (spec.depends_on.length === 0) lines.push('  (无)');
+      for (const dep of spec.depends_on) {
+        const depLive = lives.get(dep);
+        const status = depLive?.status ?? 'draft';
+        const holder = depLive?.agent === null || depLive?.agent === undefined ? '' : `，agent ${depLive.agent}`;
+        lines.push(`  ${dep}: ${status}${holder}${status === 'merged' ? '（已满足）' : '（未满足）'}`);
+      }
+    }
+  }
+  lines.push('');
+  lines.push('本 lane 占位:');
+  const laneClaims = claims.filter((record) => record.lanePath === info.laneTop);
+  if (laneClaims.length === 0) lines.push('  (无)');
+  for (const record of laneClaims) lines.push(`  ${record.display}  agent=${record.agentId}  到期 ${record.createdAt}`);
+  lines.push('');
+  lines.push('跨 lane 冲突（与本单位置重叠的 claim）:');
+  const own = (mine === undefined ? [] : (catalog.specs.get(mine.id)?.touches ?? [])).map((touch) => parseClaim(touch, info));
+  const clashes = claims.filter(
+    (record) => record.lanePath !== info.laneTop && own.some((path) => conflicts(path, parseClaim(record.display, info))),
+  );
+  if (clashes.length === 0) lines.push('  (无)');
+  for (const record of clashes) lines.push(`  ${record.display}  lane=${record.lane ?? '(main)'} agent=${record.agentId}`);
+  lines.push('');
+  lines.push('契约提醒（本 lane 相关）:');
+  const contractTasks: ContractTask[] = [...specs.values()].map((spec) => {
+    const live = lives.get(spec.id);
+    return { id: spec.id, status: live?.status ?? 'draft', reads: spec.reads, touches: spec.touches, assigned_lane: live?.lane ?? null };
+  });
+  const alerts = buildContractAlerts(info, contractTasks, repoHandoffs).filter((alert) => alert.task === mine?.id || alert.peer_task === mine?.id);
+  lines.push(alerts.length === 0 ? '  (无)' : alerts.map((alert) => {
+    const source = [alert.peer_task, alert.peer_lane, alert.handoff_path].filter((item): item is string => item !== null).join(' / ');
+    return `  ${alert.kind}: ${alert.path} ← ${source || alert.summary}${source ? `（${alert.summary}）` : ''}`;
+  }).join('\n'));
+  lines.push('');
+  lines.push('最近交接单:');
+  if (recent.length === 0) lines.push('  (无)');
+  for (const handoff of recent) lines.push(`  ${handoff.id}  ${handoff.at}  ${handoff.title}`);
+  lines.push('');
+  lines.push('硬规则: 只改 touches 内的文件；越界前先 cowork claim 扩范围。');
+  return lines.join('\n');
 }
 
 export interface LaneNewResult {

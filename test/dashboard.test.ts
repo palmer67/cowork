@@ -90,7 +90,7 @@ test('read-only status/snapshot/list/show ignore a held lock and never create or
     mkdirSync(path.join(fixture.state, 'lock'));
     const owner = JSON.stringify({ pid: process.pid, host: hostname(), token: 'external-writer', acquiredAt: new Date().toISOString() });
     writeFileSync(path.join(fixture.state, 'lock', 'owner.json'), owner);
-    for (const args of [['status'], ['snapshot', '--json'], ['task', 'ls', '--json'], ['task', 'show', 't-000001', '--json']]) {
+    for (const args of [['status'], ['snapshot', '--json'], ['task', 'ls', '--json'], ['task', 'show', 't-000001', '--json'], ['brief']]) {
       const start = performance.now();
       const result = cw(fixture.root, args);
       assert.equal(result.status, 0, result.stderr);

@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { claim, doctorFix, expiresAt, release, status } from './claims.ts';
-import { CoworkError, EXIT, general } from './errors.ts';
+import { CoworkError, EXIT, general, pathError } from './errors.ts';
 import { currentBranch, headCommit, repoInfo, type RepoInfo } from './git.ts';
 import { snapshot, type Snapshot } from './snapshot.ts';
 import { stateRoot, type ClaimRecord } from './store.ts';
@@ -719,6 +719,7 @@ main(process.argv.slice(2)).then(
     process.exitCode = code;
   },
   (err: unknown) => {
+    err = pathError(err, process.cwd()) ?? err;
     if (err instanceof CoworkError) {
       console.error(`cowork: ${err.message}`);
       if (err.hint !== undefined) console.error(`  → ${err.hint}`);

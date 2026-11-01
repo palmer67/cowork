@@ -9,7 +9,7 @@ import {
   existsSync,
 } from 'node:fs';
 import path from 'node:path';
-import { general } from './errors.ts';
+import { general, pathError } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import type { ClaimKind, ClaimPath } from './paths.ts';
 
@@ -54,6 +54,8 @@ export function readStateDir(dir: string): string[] {
   try {
     return readdirSync(dir);
   } catch (err) {
+    const tooLong = pathError(err, dir);
+    if (tooLong !== null) throw tooLong;
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw general(
       `任务状态不可读: ${dir}（${message(err)}）`,
@@ -156,8 +158,13 @@ export function readClaim(state: string, id: string): ClaimRecord | null {
 export function writeClaim(state: string, record: ClaimRecord): void {
   const file = claimFile(state, record.id);
   const tmp = `${file}.tmp-${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
-  renameSync(tmp, file);
+  try {
+    writeFileSync(tmp, JSON.stringify(record, null, 2), 'utf8');
+    renameSync(tmp, file);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch { /* 保留原始路径错误。 */ }
+    throw pathError(err, file) ?? err;
+  }
 }
 
 export function removeClaim(state: string, id: string): boolean {

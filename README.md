@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
   <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-155%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-175%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -24,7 +24,7 @@ Codex 在改 `src/auth/login.ts`，Claude Code 十分钟后也改同一个文件
 
 纯 CLI + 单文件 HTML 看板，可选本机前台派工面板；没有守护进程、没有容器、零运行时依赖。
 
-![cowork 看板：工作树、占位、任务与契约三块](docs/assets/board.png)
+![cowork 派工面板：车道、占位、任务与契约三块](docs/assets/board.png)
 
 ## 30 秒上手
 
@@ -126,10 +126,18 @@ draft ──ready──▶ ready ──next──▶ claimed ──start──�
 验证是「两次只操作 live 的短锁 + 锁外执行」：跑命令期间没有任何锁被占，验证完再取锁、比对 trunk/SHA/脏状态/配置没变才写结果——不满足就 fail closed（判失败，不判通过）。
 </details>
 
+合并前还能先预演一遍，不碰工作树、不碰 HEAD、不留引用：
+
+```bash
+cowork merge --dry-run dsh        # 0 可合 / 2 有冲突；--json 给脚本，--base 换基线
+```
+
+冲突按 hunk 行号报出来（`shared.txt  hunk 40-40 与 main 的 42-42 重叠`）；二进制、删除这类退化成整文件冲突的场景也会标出来。
+
 ### 3. 想知道现在谁在动什么
 
 ```bash
-cowork status    # 当前占位表：路径、车道、占用者、过期时间
+cowork status    # 四块仪表盘：车道、占位、任务、提示（≤40 行；--json 不截断）
 cowork brief     # 我这条车道该干什么：领的任务、依赖、跨车道冲突、最近交接
 cowork doctor    # 体检：过期占位、孤儿 lease、损坏的状态文件（有问题退出码 1）
 ```
@@ -197,6 +205,7 @@ cowork version
 | `cowork task import <plan.json> [--dry-run] [--ready]` | 校验计划并批量生成 draft；ready 只打印命令 |
 | `cowork task add / ready / show / ls` | 建 spec、进 ready、查队列 |
 | `cowork next` | 原子领取一个 ready 任务（同时占文件） |
+| `cowork merge --dry-run <车道> [--base <ref>] [--json]` | 合并预演：只读比较，可合退出 0、有冲突退出 2 |
 | `cowork task start / report-done / confirm-merge` | 开工 → 交付 → 合并 |
 | `cowork task report-done <id>` | 「我做完了」，进入待验证 |
 | `cowork task done <id>` | 跑 trunk 配置的验证命令：通过 → 待合并，失败 → 可重试 |
@@ -212,7 +221,7 @@ cowork version
 | `0` | 成功（含幂等刷新） |
 | `1` | 一般错误：参数不合法、没有可领的任务、依赖没 merged、状态文件损坏 |
 | `2` | 被占用或冲突：占位撞车、`next` 竞争失败、车道重名 |
-| `3` | 环境不满足：不在仓库里、找不到 git、路径越界 |
+| `3` | 环境不满足：不在仓库里、找不到 git、路径越界、Windows 路径过长（附处理建议） |
 
 错误信息一律带**谁占着**和**怎么解决**，脚本可以直接按退出码分支。
 
@@ -252,18 +261,20 @@ cowork version
 - 占位只到**文件级**，不做 hunk / AST 级合并；
 - 只能拉模式，cowork 不启动 agent；
 - 串行化以仓库为单位，多个仓库之间不协调；
-- `taskkill /F`、断电这类信号够不到的死亡，看板会停在最后一次采样（页头显示「数据截至 …」）。
+- `taskkill /F`、断电这类信号够不到的死亡，看板会停在最后一次采样（页头显示「数据截至 …」）；
+- Windows 下工作目录本身超过 260 字符时，Node 进程可能起不来（宿主限制）——换短路径，或开启系统长路径支持并设 `git config core.longpaths true`。
 
 ## 参与开发
 
 ```bash
-npm test                              # 155 个测试：node:test + 真实 git worktree
+npm test                              # 175 个测试：node:test + 真实 git worktree
 npx tsc --noEmit                      # 类型检查
 npm run build                         # 编译到 dist/
 node tools/mutex-gate.mjs             # 并发门槛：8 进程 × 1000 次，不许有一次重叠
 node tools/accept-m1.mjs --with-build # M1 验收（10 条）
 node tools/accept-panel.mjs          # M1.5 验收（13 条，含 test / tsc）
 node tools/accept-m2.mjs             # M2 验收（20 条：验证、恢复、契约提醒）
+node tools/accept-m3.mjs             # M3 验收（10 条：预演、仪表盘、路径加固、尾巴）
 ```
 
 源码是 TypeScript（ESM，`node:` 前缀），测试用 `node --experimental-strip-types` 直接跑，不经编译。设计文档在 [`docs/`](docs/)，历次交接单在 [`.cowork/notes/`](.cowork/notes/)——cowork 自己也是用它自己管理的。

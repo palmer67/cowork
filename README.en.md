@@ -5,7 +5,7 @@
 <p align="center">
   <img alt="node" src="https://img.shields.io/badge/node-%E2%89%A5%2022.6-5FA04E">
   <a href="https://github.com/palmer67/cowork/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/palmer67/cowork/actions/workflows/ci.yml/badge.svg"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-155%20passing-brightgreen">
+  <img alt="tests" src="https://img.shields.io/badge/tests-175%20passing-brightgreen">
   <img alt="runtime deps" src="https://img.shields.io/badge/runtime%20deps-0-informational">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue">
   <img alt="platform" src="https://img.shields.io/badge/verified-Windows-0078d4">
@@ -24,7 +24,7 @@ Codex edits `src/auth/login.ts`. Ten minutes later Claude Code edits the same fi
 
 A CLI plus a single-file HTML board, with an optional local foreground control panel. No daemon, no containers, zero runtime dependencies.
 
-![The cowork board: worktrees, claims, tasks and contract alerts](docs/assets/board.png)
+![The cowork panel: lanes, claims, tasks and contract alerts](docs/assets/board.png)
 
 ## 30-second tour
 
@@ -124,10 +124,18 @@ draft --ready--> ready --next--> claimed --start--> in_progress
 Verification uses two short locks around the live state plus execution outside all locks: no lock is held while the command runs; afterwards the trunk, HEAD, dirty state and config are compared and the result is written only if nothing moved — otherwise it fails closed.
 </details>
 
+Before merging, rehearse it — without touching any worktree, HEAD, or ref:
+
+```bash
+cowork merge --dry-run dsh        # 0 mergeable / 2 conflicts; --json for scripts, --base for another base
+```
+
+Conflicts are reported by hunk line (`shared.txt  hunk 40-40 overlaps main's 42-42`), and the whole-file fallback used for binaries or deletions is labelled too.
+
 ### 3. See who is touching what
 
 ```bash
-cowork status    # current claims: path, lane, holder, expiry
+cowork status    # four-block dashboard: lanes, claims, tasks, hints (<=40 lines; --json untruncated)
 cowork brief     # what this lane should do: task, deps, cross-lane conflicts, latest handoff
 cowork doctor    # health check: expired claims, orphan leases, corrupt state files (exit 1 on problems)
 ```
@@ -197,6 +205,7 @@ cowork version
 | `cowork task import <plan.json> [--dry-run] [--ready]` | Validate a plan and create drafts; ready only prints commands |
 | `cowork task add / ready / show / ls` | Create a spec, promote it to ready, inspect the queue |
 | `cowork next` | Atomically claim a ready task (and its files) |
+| `cowork merge --dry-run <lane> [--base <ref>] [--json]` | Merge rehearsal: read-only, exit 0 when mergeable, 2 on conflicts |
 | `cowork task start / report-done` | Start -> deliver |
 | `cowork task done <id>` | Run the trunk verification: pass -> awaiting_merge, fail -> retryable |
 | `cowork task confirm-merge` | Merge a verified task |
@@ -212,7 +221,7 @@ Running `cowork` with no arguments prints the full usage.
 | `0` | Success (including idempotent refreshes) |
 | `1` | General error: bad arguments, no claimable task, dependency not merged, corrupt state file |
 | `2` | Busy or conflicting: claim collision, lost `next` race, duplicate lane |
-| `3` | Environment not satisfied: not a git repo, git missing, path escapes the repo |
+| `3` | Environment not satisfied: not a git repo, git missing, path escapes the repo, Windows path too long (with a hint) |
 
 Error messages always include **who holds it** and **how to resolve it**, so scripts can branch on the exit code alone.
 
@@ -252,18 +261,20 @@ The code is plain Node with no native dependencies, but the concurrency primitiv
 - Claims are **file-level** only; no hunk or AST merge;
 - Pull-only: cowork never launches an agent;
 - Serialization is per repository; multiple repos are not coordinated;
-- Deaths that get no signal (`taskkill /F`, power loss) leave the board at its last sample — the header always shows the data timestamp.
+- Deaths that get no signal (`taskkill /F`, power loss) leave the board at its last sample — the header always shows the data timestamp;
+- On Windows, a working directory longer than 260 characters can stop the Node process from starting at all (a host limit) — move to a shorter path, or enable long paths and set `git config core.longpaths true`.
 
 ## Contributing
 
 ```bash
-npm test                              # 155 tests: node:test against real git worktrees
+npm test                              # 175 tests: node:test against real git worktrees
 npx tsc --noEmit                      # type check
 npm run build                         # compile to dist/
 node tools/mutex-gate.mjs             # concurrency gate: 8 processes x 1000 runs, zero overlap
 node tools/accept-m1.mjs --with-build # M1 acceptance (10 checks)
 node tools/accept-panel.mjs          # M1.5 acceptance (13 checks, includes test / tsc)
 node tools/accept-m2.mjs             # M2 acceptance (20 checks: verify, recovery, contracts)
+node tools/accept-m3.mjs             # M3 acceptance (10 checks: rehearsal, dashboard, paths, leftovers)
 ```
 
 The source is TypeScript (ESM, `node:` prefixed imports). Tests run straight from source via `node --experimental-strip-types`. Design docs live in [`docs/`](docs/); handoff notes in [`.cowork/notes/`](.cowork/notes/) — cowork is managed by cowork itself.

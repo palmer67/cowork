@@ -37,3 +37,6 @@ Thumbs.db
 
 # 本地工具缓存
 .codegraph/
+
+# 本机视觉工具的产物
+.dsh-vision-router/

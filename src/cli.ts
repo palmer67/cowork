@@ -28,6 +28,7 @@ import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './
 import { importPlan } from './planimport.ts';
 import { createPanelServer, parsePort } from './uiserver.ts';
 import { taskDone } from './taskverify.ts';
+import { previewMerge, renderMergePreview } from './merge.ts';
 
 /** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
 const KNOWN_COMMANDS = new Set([
@@ -42,6 +43,7 @@ const KNOWN_COMMANDS = new Set([
   'lane',
   'brief',
   'doctor',
+  'merge',
 ]);
 
 const USAGE = `cowork — 多 agent 同仓协作纪律层
@@ -51,6 +53,8 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork claim <路径>...          占位（精确文件或目录前缀，目录可写 dir/**）
   cowork release [<路径>...]      释放占位（省略路径则释放本工作树全部）
   cowork status [--json]          查看当前全部占位
+  cowork merge --dry-run <lane> [--base <ref>] [--json]
+                                  只读合并预演（不修改工作树或引用）
   cowork snapshot [--json]        只读快照：车道、未提交改动、占位与任务
   cowork task add --title <文本> [--touches <路径>]... [--reads <路径>]...
                [--depends <id>]... [--done-when <命令>]...
@@ -737,6 +741,14 @@ async function main(argv: readonly string[]): Promise<number> {
       return runRelease(info, rest, flags.has('force'));
     case 'status':
       return runStatus(info, flags.has('json'));
+    case 'merge': {
+      if (!flags.has('dry-run') || rest.length !== 1 || args.flags.has('base')) {
+        throw general('merge 需要 --dry-run 和一个车道', '用法: cowork merge --dry-run <lane> [--base <ref>] [--json]');
+      }
+      const preview = previewMerge(info, rest[0]!, value(args, 'base') ?? undefined);
+      console.log(flags.has('json') ? JSON.stringify(preview, null, 2) : renderMergePreview(preview));
+      return preview.can_merge ? EXIT.OK : EXIT.BUSY;
+    }
     case 'snapshot':
       return runSnapshot(info, flags.has('json'));
     case 'ui':

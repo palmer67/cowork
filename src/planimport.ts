@@ -2,8 +2,6 @@ import { mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 
 import path from 'node:path';
 import { general } from './errors.ts';
 import type { RepoInfo } from './git.ts';
-import { stateRoot } from './store.ts';
-import { withLock } from './mutex.ts';
 import { formatClaim, parseClaim } from './paths.ts';
 import { newTaskId, renderTaskSpec, specDir, type TaskSpec } from './tasks.ts';
 
@@ -185,21 +183,20 @@ export async function importPlan(info: RepoInfo, file: string, options: { dryRun
   if (options.dryRun) return { tasks: specs.map((spec, i) => ({ key: tasks[i]!.key, id: spec.id, depends_on: spec.depends_on, path: spec.path })), specs, dryRun: true };
 
   const written: string[] = [];
-  await withLock(stateRoot(info), () => {
-    mkdirSync(dir, { recursive: true });
-    try {
-      for (const spec of specs) {
-        writeFileSync(spec.path, renderTaskSpec(spec), { encoding: 'utf8', flag: 'wx' });
-        written.push(spec.path);
-      }
-    } catch (err) {
-      const rollbackErrors: string[] = [];
-      for (const filePath of written) {
-        try { unlinkSync(filePath); } catch (rollbackError) { rollbackErrors.push(`${filePath}: ${errorMessage(rollbackError)}`); }
-      }
-      issue(`写入任务规格失败（${errorMessage(err)}）`, rollbackErrors.length === 0 ? '本批次已回滚，请检查 .cowork/tasks 是否可写。' : `回滚失败，需人工处理: ${rollbackErrors.join('; ')}`);
+  // spec 路径/批量文件写入在 live 锁外；wx 拒绝覆盖，失败仍按本批次清单回滚。
+  mkdirSync(dir, { recursive: true });
+  try {
+    for (const spec of specs) {
+      writeFileSync(spec.path, renderTaskSpec(spec), { encoding: 'utf8', flag: 'wx' });
+      written.push(spec.path);
     }
-  }, { createStateDir: false });
+  } catch (err) {
+    const rollbackErrors: string[] = [];
+    for (const filePath of written) {
+      try { unlinkSync(filePath); } catch (rollbackError) { rollbackErrors.push(`${filePath}: ${errorMessage(rollbackError)}`); }
+    }
+    issue(`写入任务规格失败（${errorMessage(err)}）`, rollbackErrors.length === 0 ? '本批次已回滚，请检查 .cowork/tasks 是否可写。' : `回滚失败，需人工处理: ${rollbackErrors.join('; ')}`);
+  }
   return { tasks: specs.map((spec, i) => ({ key: tasks[i]!.key, id: spec.id, depends_on: spec.depends_on, path: spec.path })), specs, dryRun: false };
 }
 

@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { hostname } from 'node:os';
 import path from 'node:path';
@@ -184,7 +184,7 @@ function requireRun(state: string, id: string, runId: string): TaskLive {
   return live;
 }
 
-export function readPidStartedAt(pid: number): Promise<{ at: string | null; error: string | null }> {
+export function readPidStartedAt(pid: number, timeoutMs = 1000): Promise<{ at: string | null; error: string | null }> {
   if (process.platform !== 'win32') return Promise.resolve({ at: null, error: 'PowerShell PID 启动时间查询仅在 Windows 提供' });
   const script = "$p=Get-Process -Id ([int]$env:COWORK_PID) -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')";
   const env = {
@@ -192,10 +192,16 @@ export function readPidStartedAt(pid: number): Promise<{ at: string | null; erro
     SystemRoot: process.env['SystemRoot'] ?? '',
     COWORK_PID: String(pid),
   };
+  // PID 元数据不可得可以安全降级；查询不能无限等待，拖住验证退出与 doctor。
   return execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', windowsHide: true, shell: false, env,
+    encoding: 'utf8', windowsHide: true, shell: false, env, timeout: timeoutMs,
   }).then(({ stdout }) => ({ at: stdout.trim() || null, error: stdout.trim() ? null : 'PowerShell 未返回启动时间' }))
-    .catch((err: unknown) => ({ at: null, error: detail(err) }));
+    .catch((err: unknown) => ({
+      at: null,
+      error: (err as { killed?: boolean })?.killed === true
+        ? `PowerShell PID 启动时间查询超时（${timeoutMs}ms），启动时间不可得`
+        : detail(err),
+    }));
 }
 
 async function recordProgress(info: RepoInfo, id: string, runId: string, verification: VerificationLive): Promise<void> {
@@ -203,6 +209,23 @@ async function recordProgress(info: RepoInfo, id: string, runId: string, verific
     const live = requireRun(state, id, runId);
     writeTaskLive(state, { ...live, updated_at: new Date().toISOString(), verification });
   });
+}
+
+/** 仅在锁外调用；Windows 优先杀整棵树，非 Windows 使用独立进程组。 */
+async function terminateTree(child: ChildProcess): Promise<void> {
+  if (child.pid === undefined) return;
+  if (process.platform === 'win32') {
+    const taskkill = path.join(process.env['SystemRoot'] ?? 'C:\\Windows', 'System32', 'taskkill.exe');
+    try {
+      await execFileAsync(taskkill, ['/T', '/F', '/PID', String(child.pid)], {
+        windowsHide: true, shell: false, timeout: 5000,
+      });
+      return;
+    } catch { /* 系统工具失败时再回退到直接 child.kill。 */ }
+  } else {
+    try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* 已退出或进程组不可得。 */ }
+  }
+  child.kill();
 }
 
 function runCommand(
@@ -218,24 +241,45 @@ function runCommand(
     let pid: number | null = null;
     let spawnError: string | null = null;
     let progress = Promise.resolve();
-    const child = execFile(command.argv[0]!, command.argv.slice(1), {
-      cwd,
-      env,
-      windowsHide: true,
-      shell: false,
-      maxBuffer: 8 * 1024 * 1024,
-    }, (err, stdout, stderr) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(command.argv[0]!, command.argv.slice(1), {
+        cwd, env, windowsHide: true, shell: false,
+        detached: process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      resolve({ spawned: false, pid: null, exit: null, timedOut: false, duration: Date.now() - started, output: '', error: detail(err) });
+      return;
+    }
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let bytes = 0;
+    let outputError: string | null = null;
+    let termination: Promise<void> | null = null;
+    const stop = (): void => { termination ??= terminateTree(child); };
+    const capture = (target: Buffer[], chunk: Buffer): void => {
+      const remaining = Math.max(0, 8 * 1024 * 1024 - bytes);
+      target.push(chunk.subarray(0, remaining));
+      bytes += chunk.length;
+      if (bytes > 8 * 1024 * 1024 && outputError === null) {
+        outputError = '验证输出超过 8 MiB，已终止进程树';
+        stop();
+      }
+    };
+    child.stdout?.on('data', (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr?.on('data', (chunk: Buffer) => capture(stderr, chunk));
+    child.once('close', (code, signal) => {
       clearTimeout(timer);
-      void progress.then(() => {
-        const output = `${String(stdout ?? '')}${String(stderr ?? '')}`;
-        const error = !spawned ? spawnError ?? detail(err) : err === null ? null : detail(err);
-        const exit = !spawned || timedOut ? null : typeof err?.code === 'number' ? err.code : err === null ? 0 : 1;
+      void Promise.all([progress, termination]).then(() => {
+        const output = `${Buffer.concat(stdout).toString('utf8')}${Buffer.concat(stderr).toString('utf8')}`;
+        const error = spawnError ?? outputError ?? (signal === null ? null : `验证进程被 ${signal} 终止`);
+        const exit = !spawned || timedOut ? null : outputError !== null ? 1 : code ?? 1;
         resolve({ spawned, pid, exit, timedOut, duration: Date.now() - started, output, error });
       });
     });
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      stop();
     }, command.timeout_ms);
     child.once('spawn', () => {
       spawned = true;

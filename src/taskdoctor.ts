@@ -103,6 +103,7 @@ function recoverVerification(state: string, decision: RecoveryDecision, fixed: s
   const live = listTaskLiveStates(state).lives.find((item) => item.id === candidate.id);
   if (
     !decision.recover || live === undefined || live.status !== candidate.task_status ||
+    live.verification?.status !== 'running' ||
     live.verification?.run_id !== candidate.run_id || live.verification.pid !== candidate.pid ||
     live.verification.host !== candidate.host || live.verification.pid_started_at !== candidate.pid_started_at
   ) return;
@@ -115,7 +116,13 @@ function recoverVerification(state: string, decision: RecoveryDecision, fixed: s
   };
   const recovery = { at: now, run_id: candidate.run_id, reason: decision.reason };
   if (candidate.task_status === 'blocked') {
-    writeTaskLive(state, { ...live, updated_at: now, verification, recovery });
+    writeTaskLive(state, {
+      ...live, updated_at: now, verification, recovery,
+      history: [...live.history, {
+        at: now, from: 'blocked', to: 'blocked', agent: 'doctor',
+        note: `doctor --fix recovery: ${decision.reason}`,
+      }],
+    });
     fixed.push(`已收尾阻塞任务 ${live.id} 的残留验证（${decision.reason}；保留状态与占位）`);
     return;
   }

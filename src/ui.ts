@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { general } from './errors.ts';
+import { general, pathError } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { snapshot } from './snapshot.ts';
 import type { ContractAlert } from './contracts.ts';
@@ -628,6 +628,8 @@ export function writePanel(
     } catch {
       // 清理临时文件失败不掩盖真正的写入错误。
     }
+    const tooLong = pathError(err, file);
+    if (tooLong !== null) throw tooLong;
     throw general(
       `无法写入面板文件 ${file}: ${err instanceof Error ? err.message : String(err)}`,
       '检查目标目录是否可写；Windows 上避开只读目录和过长的路径。',

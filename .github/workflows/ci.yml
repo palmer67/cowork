@@ -84,6 +84,13 @@ jobs:
           if [[ '${{ inputs.legacy_acceptance_suites }}' == 'true' ]]; then unset COWORK_ACCEPT_SKIP_SUITE; fi
           node tools/accept-panel.mjs
 
+      - name: M2 验收（20 条）
+        run: node tools/accept-m2.mjs
+
+      # M3 第10条就是前置的 test/tsc/build/M1/panel/M2 门禁；独立跑避免重复整套。
+      - name: M3 行为验收（1–9；第10条由前置门禁覆盖）
+        run: node tools/accept-m3.mjs --only 1,2,3,4,5,6,7,8,9
+
   stress:
     name: 并发压测（20 轮）
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_stress)

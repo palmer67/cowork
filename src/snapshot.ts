@@ -4,10 +4,9 @@ import { expiresAt, isExpired } from './claims.ts';
 import { git, headCommit, type RepoInfo } from './git.ts';
 import { buildContractAlerts, type ContractAlert } from './contracts.ts';
 import { readHandoffs, type HandoffMeta } from './handoffs.ts';
-import { withLock } from './mutex.ts';
 import { listClaims, stateRoot, type ClaimRecord } from './store.ts';
 import { collectTaskViews, type TaskView } from './taskops.ts';
-import { listTaskLiveStates, type TaskLiveStates, type VerificationLive } from './taskstore.ts';
+import { listTaskLiveStates, type VerificationLive } from './taskstore.ts';
 import { readTrunkCatalog } from './tasks.ts';
 import { listWorktrees, type Worktree } from './worktrees.ts';
 
@@ -170,7 +169,7 @@ function observeLane(worktree: Worktree, lane: string | null, info: RepoInfo): {
 
   const status = attempt(
     // Windows 长路径：不开 core.longpaths 时 git status 会在深目录上失败。
-    ['-c', 'core.longpaths=true', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
+    ['--no-optional-locks', '-c', 'core.longpaths=true', 'status', '--porcelain=v1', '-z', '--untracked-files=all'],
     lanePath,
   );
   entry.observed_at = new Date().toISOString();
@@ -192,7 +191,7 @@ function observeLane(worktree: Worktree, lane: string | null, info: RepoInfo): {
   return { entry, handoffs: handoffs.metas };
 }
 
-/** live 记录在 mutex 内一次读齐，映射/派生都在锁外做。 */
+/** 原子发布的 live 文件逐条只读采样；不承诺跨文件线性一致。 */
 function mapClaims(records: readonly ClaimRecord[]): SnapshotClaim[] {
   const now = Date.now();
   return records.map((rec) => ({
@@ -237,17 +236,10 @@ function toSnapshotTask(view: TaskView): SnapshotTask {
 
 /** 面板唯一数据源；只读，不写 claims，也不创建状态目录。 */
 export async function snapshot(info: RepoInfo): Promise<Snapshot> {
-  // catalog 要跑 git，必须在锁外读；live（claims/task live）在锁内一次取齐。
+  // 只读命令不取锁、不恢复 intent，也不创建 live 目录。
   const catalog = readTrunkCatalog(info);
   const state = stateRoot(info);
-  const live = await withLock(
-    state,
-    () => ({
-      claims: listClaims(state),
-      tasks: listTaskLiveStates(state) as TaskLiveStates,
-    }),
-    { createStateDir: false },
-  );
+  const live = { claims: listClaims(state), tasks: listTaskLiveStates(state) };
   const claims = mapClaims(live.claims);
   const view = collectTaskViews(info, catalog, live.tasks);
   const tasks = view.views.map(toSnapshotTask);

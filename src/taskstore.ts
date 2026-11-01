@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { general, CoworkError } from './errors.ts';
+import { general, CoworkError, pathError } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 import { stateRoot, readStateDir } from './store.ts';
 import type { TaskStatus } from './tasks.ts';
@@ -260,7 +260,9 @@ export function writeTaskLive(state: string, live: TaskLive): void {
     writeFileSync(tmp, `${JSON.stringify(live, null, 2)}\n`, 'utf8');
     renameSync(tmp, file);
   } catch (err) {
-    rmSync(tmp, { force: true });
+    try { rmSync(tmp, { force: true }); } catch { /* 保留原始路径错误。 */ }
+    const tooLong = pathError(err, file);
+    if (tooLong !== null) throw tooLong;
     if (err instanceof CoworkError) throw err;
     throw general(`无法写入任务状态: ${file}（${message(err)}）`, '检查 .git/cowork/tasks 是否可写、磁盘是否已满。');
   }
@@ -318,7 +320,7 @@ const M2_TRANSITIONS: Partial<Record<TaskStatus, readonly TaskStatus[]>> = {
   reported_done: ['verifying', 'blocked'],
   verify_failed: ['verifying', 'blocked'],
   verifying: ['reported_done', 'verify_failed', 'awaiting_merge', 'blocked'],
-  awaiting_merge: ['merged', 'blocked'],
+  awaiting_merge: ['merged', 'blocked', 'cancelled'],
 };
 
 /** M2 专用状态入口；旧 assertTransition 保持 M1 语义。 */

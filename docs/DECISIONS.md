@@ -250,3 +250,99 @@ CLI 分配不透明任务 id；计划 key 只用于解析依赖别名，不写�
 `--dry-run` 只打印映射与目标路径；`--ready` 仅打印命令，不自动 commit 或 ready。
 
 理由：ready 要求 spec 在 trunk 可达（D9/A1），导入不能代替人审阅、提交或推进状态机。
+
+## D14 — awaiting_merge 允许 owner 取消并释放 lease 与占位
+
+状态：已定（2026-11-01，WORKORDER-M3 §5）
+
+`task cancel` 接受 `awaiting_merge`，仍按当前车道和 agent 校验 owner。取消与释放本任务 claims
+在同一次 live 事务内完成，清空 `lane`、`lanePath`、`agent`，历史保留执行者与取消原因。
+验证通过只表示等待判官确认，不使任务变成不可撤销；取消不回滚代码、不代替 Git 操作。
+
+## D15 — 只读命令不取 live 写锁，也不恢复 intent
+
+状态：已定（2026-11-01，WORKORDER-M3 §1、§3）
+
+`status`、`snapshot`、`task ls/show`、`brief`、合并预演逐文件采样 live/claims，不创建状态目录，
+不回收过期占位，不恢复 intent；残留以提示呈现，显式写命令或 `doctor --fix` 才处理恢复。
+本条落实 M3 的只读要求，取代这些只读路径先取 mutex 的旧实现，不改变写事务的互斥规则。
+
+`status` 复用 snapshot，展示车道、占位、任务、提示四块；人类输出最多 38 行，超出逐块折叠，
+JSON 保留全部条目。任务按状态计数，验证失败摘要最多 60 字；漂移沿用 A1 的 spec blob 比较。
+各文件的采样时刻可能不同，展示结果不是跨文件原子快照，不能据此绕过写命令的锁内复核。
+
+## D16 — 合并预演只比较提交，不改变源仓库的可见状态
+
+状态：已定（2026-11-01，WORKORDER-M3 §2）
+
+`merge --dry-run <lane>` 解析车道分支 HEAD 与 `--base`（默认 `config.trunk`）后固定 SHA，
+优先运行 `git merge-tree --write-tree`；只允许产生未引用的临时 Git 对象，不写源 HEAD/index/
+工作区、分支或引用，也不取 live 锁。旧 Git 兼容路径在系统临时区克隆后执行
+`merge --no-commit --no-ff`，结束删除临时目录，不在源仓库登记 worktree。
+
+冲突路径来自 Git 的 NUL 分隔输出。文本重叠以共同祖先上的双方 diff hunk 定位并展示双方行号；
+二进制、删除/重命名或不能可靠定位的冲突报告为整文件，不伪造行号。JSON 字段为 snake_case。
+退出码为 0 可合、2 冲突、1 参数或仓库错误、3 不在 Git 仓库；预演不执行验证或真正合并。
+
+## D17 — 长路径只按真实 I/O 失败报错，不预设 260 字符上限
+
+状态：已定（2026-11-01，WORKORDER-M3 §4）
+
+内部文件系统路径用 `node:path` 解析；Git 使用 argv 和原样 cwd、`shell:false`。
+声明尚不存在的 touches 路径可以超过 260 字符，不因长度提前拒绝。真实 `ENAMETOOLONG`、Git
+filename-too-long，以及 Windows 深层路径 I/O 的相关 `ENOENT`，统一为退出码 3，提示「路径过长」
+和「可开启 Windows 长路径支持」，不向用户输出堆栈；临时输出失败时清理本次临时文件。
+
+spec 写入在 live 锁外以 `wx` 防覆盖；批量导入失败按本批清单回滚，live 锁只保护 live 状态。
+中文、空格、三层嵌套超过 260 字符的真实文件 I/O 均有测试；宿主在 CLI 启动前拒绝 cwd 的边界
+单列下方 ADR 草案，未据此自行新增启动器或修改验收约定。
+
+## D18 — 验证超时终止整棵进程树
+
+状态：已定（2026-11-01，WORKORDER-M3 §5）
+
+验证命令始终在 live 锁外运行。Windows 超时或输出超过既有 8 MiB 限额时，优先调用
+`taskkill /T /F /PID <pid>`，系统工具失败才回退 `child.kill()`；非 Windows 为每个验证命令
+建立独立进程组并向该组发送终止信号，避免子孙进程遗留。进程终止与 PID 启动时间查询都不在锁内。
+
+## D19 — blocked 的残留验证只收尾验证，不改变阻塞状态
+
+状态：已定（2026-11-01，WORKORDER-M3 §5）
+
+`doctor --fix` 对 `blocked` 只处理 `verification.status=running` 的过期运行；沿用 D13 的进程
+判定，在锁外确认未启动、已退出或 PID 已复用，进程仍在或无法确认则拒绝恢复。
+再次取锁时复核任务状态、run_id、PID、host 与启动时间，再把验证标为 `stale`，追加一次
+`blocked → blocked` recovery 历史；保留 blocked 原因、lease 和 claims。重复修复不重复追加。
+
+## ADR-M3-01（草案）— 宿主在 CLI 启动前拒绝超过 260 字符的 cwd
+
+状态：待判官裁定；不构成已批准的新语义（2026-11-01）
+
+观察：当前 Windows/Node 22.14 环境将可执行程序 cwd 直接设为超过 260 字符时，可能在 Node
+加载 CLI 前返回宿主路径错误；CLI 的错误处理尚未运行，无法把该启动错误包装成退出码 3。
+已完成的长路径测试是短 cwd 仓库下的真实三层深路径读写，包括实际失败后的清理，不能冒充
+「从超长 cwd 启动程序」的覆盖。复现边界：系统临时区创建三个约 85 字符的嵌套目录，
+再用 `spawnSync(process.execPath, [cli, 'status'], { cwd: deepPath, shell: false })` 启动。
+
+补充证据：320 字符 cwd 下，连 `node --version` 以及 `node <cli> --version` 都返回
+`spawnSync ... ENOENT`、`status=null`，没有进入 Node。完整结构化记录保留于
+`%TEMP%/cowork-logs/2026-11-01-m3-host-long-cwd.log`，与产品深路径 I/O 验收分开。
+
+待裁定：长路径验收是否要求覆盖宿主启动，若要求，是增加外部短 cwd 启动器，还是把宿主与
+Windows 长路径配置列为运行前置条件。两种方案均涉及工单未定义的启动契约；本批不自行选择。
+
+## ADR-M3-02（草案）— PID 元数据查询的时间预算
+
+状态：实现补充待判官复核（2026-11-01）；不改变 D13 的不可得降级与拒绝冒险恢复规则
+
+CI `41310375377` 的 M2 第8/10/14条出现元数据就绪等待超时、验证已结束后才取到运行态和
+超时 CLI 迟迟不退出。`readPidStartedAt` 原先无超时，验证退出需要等待其 progress，导致
+可选进程元数据影响任务结果交付。完整失败日志见 `%TEMP%/cowork-logs/2026-11-01-ci-41310375377-full.log`。
+
+本批修复草案：查询默认上限1000ms，真实终止查询后记录 `at=null` 与超时原因；验证继续按
+其自身结果返回。doctor 对仍存活但启动时间未知的进程仍拒绝恢复。查询在锁外，既有验收
+断言与时限不调整。用户已允许为该修复追加独立提交、保留已推历史。
+
+待复核的是1秒预算是否适合目标Windows环境；需要调整时应保留有界查询与既有失败关闭，
+不能以延长验收等待或把查询失败当作验证失败替代。新回归覆盖真实PowerShell启动超时，
+最终效果以修复提交对应的CI和判官合并树复验为准。

@@ -2,7 +2,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { claim, doctorFix, expiresAt, release, status } from './claims.ts';
-import { CoworkError, EXIT, general } from './errors.ts';
+import { CoworkError, EXIT, general, pathError } from './errors.ts';
 import { currentBranch, headCommit, repoInfo, type RepoInfo } from './git.ts';
 import { snapshot, type Snapshot } from './snapshot.ts';
 import { stateRoot, type ClaimRecord } from './store.ts';
@@ -23,11 +23,13 @@ import {
 } from './taskops.ts';
 import { next } from './tasknext.ts';
 import { doctorTasks } from './taskdoctor.ts';
-import { readTrunkCatalog } from './tasks.ts';
+import { readTrunkCatalog, specDir } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 import { importPlan } from './planimport.ts';
 import { createPanelServer, parsePort } from './uiserver.ts';
 import { taskDone } from './taskverify.ts';
+import { previewMerge, renderMergePreview } from './merge.ts';
+import { dashboard, renderDashboard } from './dashboard.ts';
 
 /** 命令名先于 needRepo() 校验：未知命令在任何目录下都是 1，而不是「不在仓库里」的 3。 */
 const KNOWN_COMMANDS = new Set([
@@ -42,6 +44,7 @@ const KNOWN_COMMANDS = new Set([
   'lane',
   'brief',
   'doctor',
+  'merge',
 ]);
 
 const USAGE = `cowork — 多 agent 同仓协作纪律层
@@ -50,7 +53,9 @@ const USAGE = `cowork — 多 agent 同仓协作纪律层
   cowork init                     初始化仓库内的 .cowork/ 与配置
   cowork claim <路径>...          占位（精确文件或目录前缀，目录可写 dir/**）
   cowork release [<路径>...]      释放占位（省略路径则释放本工作树全部）
-  cowork status [--json]          查看当前全部占位
+  cowork status [--json]          只读仪表盘：车道、占位、任务、提示（最多 40 行）
+  cowork merge --dry-run <lane> [--base <ref>] [--json]
+                                  只读合并预演（不修改工作树或引用）
   cowork snapshot [--json]        只读快照：车道、未提交改动、占位与任务
   cowork task add --title <文本> [--touches <路径>]... [--reads <路径>]...
                [--depends <id>]... [--done-when <命令>]...
@@ -205,69 +210,14 @@ async function runRelease(info: RepoInfo, inputs: readonly string[], force: bool
   return EXIT.OK;
 }
 
-function groupByLane(claims: readonly { lane: string | null; lanePath: string }[]): Map<string, number> {
-  const map = new Map<string, number>();
-  for (const rec of claims) {
-    const key = rec.lane === null ? '(主工作树)' : rec.lane;
-    map.set(key, (map.get(key) ?? 0) + 1);
-  }
-  return map;
-}
-
 function describeAgent(rec: ClaimRecord): string {
   const who = rec.agentId === 'default' ? '' : ` agent=${rec.agentId}`;
   return `pid ${rec.pid}@${rec.host}${who}`;
 }
 
 async function runStatus(info: RepoInfo, json: boolean): Promise<number> {
-  const report = await status(info);
-  if (json) {
-    const payload = {
-      schemaVersion: 1,
-      generatedAt: new Date().toISOString(),
-      repo: { root: report.mainRoot, head: headCommit(info.laneTop) },
-      this: { lane: report.lane, path: report.laneTop, agent: report.agent },
-      claims: report.claims.map((rec) => ({
-        path: rec.display,
-        kind: rec.kind,
-        lane: rec.lane,
-        branch: rec.branch,
-        agent: rec.agentId,
-        pid: rec.pid,
-        host: rec.host,
-        note: rec.note,
-        createdAt: rec.createdAt,
-        expiresAt: expiresAt(rec),
-      })),
-    };
-    console.log(JSON.stringify(payload, null, 2));
-    return EXIT.OK;
-  }
-
-  console.log(`仓库: ${report.mainRoot}`);
-  console.log(`本工作树: ${report.lane === null ? '(主工作树)' : `lane ${report.lane}`}  agent=${report.agent}`);
-  console.log(`live 状态: ${report.state}`);
-  console.log('');
-  if (report.claims.length === 0) {
-    console.log('当前没有任何占位。');
-    return EXIT.OK;
-  }
-  const width = Math.max(...report.claims.map((rec) => rec.display.length), 4);
-  console.log(`${'路径'.padEnd(width)}  车道           占用者                                 过期时间`);
-  for (const rec of report.claims) {
-    const who = `${rec.lane === null ? '(主)' : rec.lane}`;
-    console.log(
-      `${rec.display.padEnd(width)}  ${who.padEnd(14)} ${describeAgent(rec).padEnd(38)} ${expiresAt(rec)}`,
-    );
-    if (rec.note !== null) console.log(`${' '.repeat(width)}  ↳ ${rec.note}`);
-  }
-  console.log('');
-  const byLane = groupByLane(report.claims);
-  for (const [lane, count] of byLane) console.log(`${lane}: ${count} 个占位`);
-  if (report.expired.length > 0) {
-    console.log('');
-    console.log(`发现 ${report.expired.length} 个已过期占位，运行 cowork doctor --fix 清理。`);
-  }
+  const report = await dashboard(info);
+  console.log(json ? JSON.stringify(report, null, 2) : renderDashboard(report));
   return EXIT.OK;
 }
 
@@ -545,8 +495,8 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
         depends_on: values(args, 'depends'),
         done_when: values(args, 'done-when'),
       });
-      console.log(`已创建 ${spec.id}（draft）`);
-      console.log(`  ${spec.path}`);
+      console.log('已创建任务规格（draft）');
+      console.log(`  目录: ${specDir(info)}`);
       console.log(`下一步: 把 spec 提交到 trunk 后运行 cowork task ready ${spec.id}。`);
       return EXIT.OK;
     }
@@ -737,6 +687,14 @@ async function main(argv: readonly string[]): Promise<number> {
       return runRelease(info, rest, flags.has('force'));
     case 'status':
       return runStatus(info, flags.has('json'));
+    case 'merge': {
+      if (!flags.has('dry-run') || rest.length !== 1 || args.flags.has('base')) {
+        throw general('merge 需要 --dry-run 和一个车道', '用法: cowork merge --dry-run <lane> [--base <ref>] [--json]');
+      }
+      const preview = previewMerge(info, rest[0]!, value(args, 'base') ?? undefined);
+      console.log(flags.has('json') ? JSON.stringify(preview, null, 2) : renderMergePreview(preview));
+      return preview.can_merge ? EXIT.OK : EXIT.BUSY;
+    }
     case 'snapshot':
       return runSnapshot(info, flags.has('json'));
     case 'ui':
@@ -761,6 +719,7 @@ main(process.argv.slice(2)).then(
     process.exitCode = code;
   },
   (err: unknown) => {
+    err = pathError(err, process.cwd()) ?? err;
     if (err instanceof CoworkError) {
       console.error(`cowork: ${err.message}`);
       if (err.hint !== undefined) console.error(`  → ${err.hint}`);

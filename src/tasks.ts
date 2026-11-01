@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { general } from './errors.ts';
+import { general, pathError } from './errors.ts';
 import { git, gitTry } from './git.ts';
 import type { RepoInfo } from './git.ts';
 import { formatClaim, parseClaim } from './paths.ts';
@@ -389,11 +389,21 @@ export function createSpec(info: RepoInfo, input: NewSpecInput, now = new Date()
       path: file,
       specCommit: null,
     };
+    let fd: number | undefined;
     try {
-      writeFileSync(file, renderTaskSpec(spec), { encoding: 'utf8', flag: 'wx' });
+      fd = openSync(file, 'wx');
+      writeFileSync(fd, renderTaskSpec(spec), 'utf8');
+      closeSync(fd);
+      fd = undefined;
       return spec;
     } catch (err) {
+      if (fd !== undefined) {
+        try { closeSync(fd); } catch { /* 保留原始写入错误。 */ }
+        try { rmSync(file, { force: true }); } catch { /* 不删除别人的 EEXIST 文件。 */ }
+      }
       lastError = err;
+      const tooLong = pathError(err, file);
+      if (tooLong !== null) throw tooLong;
       const code = (err as { code?: string }).code;
       if (code !== 'EEXIST') {
         throw general(

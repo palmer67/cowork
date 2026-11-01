@@ -1,6 +1,6 @@
 import { realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { env, general } from './errors.ts';
+import { env, general, pathError } from './errors.ts';
 import type { RepoInfo } from './git.ts';
 
 export type ClaimKind = 'file' | 'prefix';
@@ -47,7 +47,12 @@ export function formatClaim(p: ClaimPath): string {
 function statIsDir(abs: string): boolean {
   try {
     return statSync(abs).isDirectory();
-  } catch {
+  } catch (err) {
+    // ENOENT 对尚未创建的声明路径是合法的，不能仅因长度 >260 就提前拒绝。
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      const tooLong = pathError(err, abs);
+      if (tooLong !== null) throw tooLong;
+    }
     return false;
   }
 }
@@ -63,7 +68,11 @@ function realLocation(abs: string): { real: string; missing: string[] } {
   for (;;) {
     try {
       return { real: realpathSync.native(probe), missing };
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        const tooLong = pathError(err, probe);
+        if (tooLong !== null) throw tooLong;
+      }
       const parent = path.dirname(probe);
       if (parent === probe) {
         throw env(
@@ -83,7 +92,9 @@ function realKey(laneTop: string, key: string): string {
   let realLane: string;
   try {
     realLane = realpathSync.native(laneTop);
-  } catch {
+  } catch (err) {
+    const tooLong = pathError(err, laneTop);
+    if (tooLong !== null) throw tooLong;
     throw env(
       `无法解析车道根: ${laneTop}`,
       '目录不存在或没有读取权限；先在车道根确认 cowork 能访问路径。',

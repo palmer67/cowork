@@ -33,3 +33,7 @@ Thumbs.db
 # live 状态默认放在 <git-common-dir>/cowork/，此处为兜底
 .cowork/lanes/
 .cowork/live/
+.cowork/tmp/
+
+# 本地工具缓存
+.codegraph/

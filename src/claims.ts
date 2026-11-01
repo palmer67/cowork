@@ -211,20 +211,17 @@ export interface StatusReport {
 
 export async function status(info: RepoInfo): Promise<StatusReport> {
   const state = stateRoot(info);
-  ensureState(state);
-  return withLock(state, () => {
-    const claims = listClaims(state);
-    const now = Date.now();
-    return {
-      state,
-      mainRoot: info.mainRoot,
-      laneTop: info.laneTop,
-      lane: info.laneName,
-      agent: agentId(),
-      claims,
-      expired: claims.filter((rec) => isExpired(rec, now)),
-    };
-  });
+  const claims = listClaims(state);
+  const now = Date.now();
+  return {
+    state,
+    mainRoot: info.mainRoot,
+    laneTop: info.laneTop,
+    lane: info.laneName,
+    agent: agentId(),
+    claims,
+    expired: claims.filter((rec) => isExpired(rec, now)),
+  };
 }
 
 export interface QuarantinedClaim {

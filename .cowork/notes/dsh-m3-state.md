@@ -1,3 +1,7 @@
+---
+{"lane":"dsh","created_at":"2026-11-01T14:45:00Z","title":"M3 交付状态（dsh/m3）"}
+---
+
 dsh/m3 / codex-m3 / 最终受验代码98455ba86ae1cb6ea73cede49edca5d0606966c5 / 交付7提交（用户批准追加修复保留历史）；最终文档提交以分支HEAD为准。
 证据：修复后npm test 175/175、tsc/build exit0、M1 10/10、panel 13/13、M2 20/20、M3 10/10，全套exit0；日志%TEMP%/cowork-logs/2026-11-01-m3-pid-fix/。
 CI：https://github.com/palmer67/cowork/actions/runs/41312239939 SUCCESS（98455ba，6m30s）；首轮41310375377失败M2 8/10/14的完整记录保留于%TEMP%/cowork-logs/2026-11-01-ci-41310375377-full.log。

@@ -8,7 +8,7 @@ import { CoworkError } from '../src/errors.ts';
 import { listClaims } from '../src/store.ts';
 import { addTask, blockTask, cancelTask, readyTask, reportDone, startTask } from '../src/taskops.ts';
 import { next } from '../src/tasknext.ts';
-import { taskDone } from '../src/taskverify.ts';
+import { readPidStartedAt, taskDone } from '../src/taskverify.ts';
 import { doctorTasks } from '../src/taskdoctor.ts';
 import { readTaskLive, transitionM2Task, writeTaskLive, type VerificationLive } from '../src/taskstore.ts';
 import { cw, git, makeRepo } from './m3-helpers.ts';
@@ -121,6 +121,15 @@ function alive(pid: number): boolean {
     return true;
   } catch { return false; }
 }
+
+test('Windows PID metadata deadline degrades to unavailable instead of delaying verification', { skip: process.platform !== 'win32' }, async () => {
+  // 真正启动 PowerShell 并在其启动期间超时，覆盖慢/卡住的 PID 查询。
+  const start = performance.now();
+  const result = await readPidStartedAt(process.pid, 1);
+  assert.ok(performance.now() - start < 5000, 'PID 元数据查询没有受限返回');
+  assert.equal(result.at, null);
+  assert.match(result.error ?? '', /超时|ENOENT/);
+});
 
 test('verification timeout kills children and grandchildren, records timed_out and preserves claims', async () => {
   const deep = 'setInterval(() => {}, 1000)';

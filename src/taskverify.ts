@@ -184,7 +184,7 @@ function requireRun(state: string, id: string, runId: string): TaskLive {
   return live;
 }
 
-export function readPidStartedAt(pid: number): Promise<{ at: string | null; error: string | null }> {
+export function readPidStartedAt(pid: number, timeoutMs = 1000): Promise<{ at: string | null; error: string | null }> {
   if (process.platform !== 'win32') return Promise.resolve({ at: null, error: 'PowerShell PID 启动时间查询仅在 Windows 提供' });
   const script = "$p=Get-Process -Id ([int]$env:COWORK_PID) -ErrorAction Stop; $p.StartTime.ToUniversalTime().ToString('o')";
   const env = {
@@ -192,10 +192,16 @@ export function readPidStartedAt(pid: number): Promise<{ at: string | null; erro
     SystemRoot: process.env['SystemRoot'] ?? '',
     COWORK_PID: String(pid),
   };
+  // PID 元数据不可得可以安全降级；查询不能无限等待，拖住验证退出与 doctor。
   return execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', script], {
-    encoding: 'utf8', windowsHide: true, shell: false, env,
+    encoding: 'utf8', windowsHide: true, shell: false, env, timeout: timeoutMs,
   }).then(({ stdout }) => ({ at: stdout.trim() || null, error: stdout.trim() ? null : 'PowerShell 未返回启动时间' }))
-    .catch((err: unknown) => ({ at: null, error: detail(err) }));
+    .catch((err: unknown) => ({
+      at: null,
+      error: (err as { killed?: boolean })?.killed === true
+        ? `PowerShell PID 启动时间查询超时（${timeoutMs}ms），启动时间不可得`
+        : detail(err),
+    }));
 }
 
 async function recordProgress(info: RepoInfo, id: string, runId: string, verification: VerificationLive): Promise<void> {

@@ -398,12 +398,15 @@ export async function cancelTask(
       );
     }
     requireOwner(live, agent, 'cancel');
-    const cancelled = transitionTask(state, id, 'cancelled', {
+    const options = {
       agent,
       lane: null,
       lanePath: null,
       note: reason === null ? 'cancel' : `cancel: ${reason}`,
-    });
+    };
+    const cancelled = live.status === 'awaiting_merge'
+      ? transitionM2Task(state, id, 'cancelled', { ...options, agent: null, historyAgent: agent })
+      : transitionTask(state, id, 'cancelled', options);
     const released = releaseTaskClaims(info, state, spec);
     return { live: cancelled, released };
   });

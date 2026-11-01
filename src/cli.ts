@@ -23,7 +23,7 @@ import {
 } from './taskops.ts';
 import { next } from './tasknext.ts';
 import { doctorTasks } from './taskdoctor.ts';
-import { readTrunkCatalog } from './tasks.ts';
+import { readTrunkCatalog, specDir } from './tasks.ts';
 import { DEFAULT_WATCH_INTERVAL_MS, openPanel, watchPanel, writePanel } from './ui.ts';
 import { importPlan } from './planimport.ts';
 import { createPanelServer, parsePort } from './uiserver.ts';
@@ -495,8 +495,8 @@ async function runTask(info: RepoInfo, args: Args, rest: readonly string[]): Pro
         depends_on: values(args, 'depends'),
         done_when: values(args, 'done-when'),
       });
-      console.log(`已创建 ${spec.id}（draft）`);
-      console.log(`  ${spec.path}`);
+      console.log('已创建任务规格（draft）');
+      console.log(`  目录: ${specDir(info)}`);
       console.log(`下一步: 把 spec 提交到 trunk 后运行 cowork task ready ${spec.id}。`);
       return EXIT.OK;
     }

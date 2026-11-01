@@ -320,7 +320,7 @@ const M2_TRANSITIONS: Partial<Record<TaskStatus, readonly TaskStatus[]>> = {
   reported_done: ['verifying', 'blocked'],
   verify_failed: ['verifying', 'blocked'],
   verifying: ['reported_done', 'verify_failed', 'awaiting_merge', 'blocked'],
-  awaiting_merge: ['merged', 'blocked'],
+  awaiting_merge: ['merged', 'blocked', 'cancelled'],
 };
 
 /** M2 专用状态入口；旧 assertTransition 保持 M1 语义。 */
